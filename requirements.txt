@@ -5,3 +5,4 @@ flask
 gspread
 google-auth
 openai
+streamlit
