@@ -1,0 +1,7 @@
+python-dotenv
+requests
+slack_bolt
+flask
+gspread
+google-auth
+openai
