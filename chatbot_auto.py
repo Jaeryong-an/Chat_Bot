@@ -1192,26 +1192,40 @@ def start_auto_gmail_checker():
     threading.Thread(target=loop, daemon=True).start()
 
 if __name__ == "__main__":
+    import threading
     from datetime import datetime, timedelta
     import traceback
 
-    # ✅ オンタイム感知
-    start_auto_gmail_checker()
+    print("🚀 chatbot_auto.py 起動開始")
 
-    # ✅ Slack 実行 (Bot)
-    handler = SocketModeHandler(slack_app, os.getenv("SLACK_APP_TOKEN"))
-    handler.start()
+    # ✅ オンタイム感知開始
+    try:
+        print("🟢 start_auto_gmail_checker 実行")
+        start_auto_gmail_checker()
+    except Exception as e:
+        print(f"❌ start_auto_gmail_checker 失敗: {e}")
+        traceback.print_exc()
 
-    # ✅ 過去メール取得（一度のみ）
+    # ✅ Slack 実行
+    try:
+        print("🟢 Slack SocketModeHandler 起動")
+        handler = SocketModeHandler(slack_app, os.getenv("SLACK_APP_TOKEN"))
+        threading.Thread(target=handler.start, daemon=True).start()
+    except Exception as e:
+        print(f"❌ Slack 起動失敗: {e}")
+        traceback.print_exc()
+
+    # ✅ Gmail アカウント読み込みと収集開始
     today = datetime.today().date()
-    default_start = today - timedelta(days=7)  # ログなければ7日
+    default_start = today - timedelta(days=7)
 
     try:
+        print("📄 gmail_accounts.json 読み込み中...")
         with open("gmail_accounts.json") as f:
             config = json.load(f)
             accounts = config.get("accounts", [])
             if not isinstance(accounts, list):
-                print("❌ 'accounts' フィールドが不正な形式です")
+                print("❌ 'accounts' フィールド形式エラー")
                 accounts = []
     except Exception as e:
         print(f"❌ gmail_accounts.json 読み込み失敗: {e}")
@@ -1219,11 +1233,10 @@ if __name__ == "__main__":
 
     fetch_log = load_fetch_log()
 
-    for acct in config.get("accounts", []):
+    for acct in accounts:
         email = acct["email"]
         refresh_token = acct["refresh_token"]
 
-        # 📅 ログ基準スタートび計算
         log_entry = fetch_log.get(email)
         if isinstance(log_entry, dict) and log_entry.get("last_date"):
             start_date = datetime.strptime(log_entry["last_date"], "%Y-%m-%d").date() + timedelta(days=1)
@@ -1244,22 +1257,26 @@ if __name__ == "__main__":
                 fetch_log=fetch_log
             )
         except Exception as e:
-            print(f"❌ {email} の処理中にエラー: {e}")
+            print(f"❌ {email} のGmail取得エラー: {e}")
             traceback.print_exc()
 
-    # ✅ Flask コールバックを有効にするか確認
+    # ✅ Flask サーバー起動（必要に応じて）
     if os.getenv("USE_FLASK", "false").lower() == "true":
-        def run_flask():
-            flask_app.run(host="0.0.0.0", port=5000)
+        try:
+            def run_flask():
+                print("🚀 Flaskサーバー起動...")
+                flask_app.run(host="0.0.0.0", port=5000)
 
-        threading.Thread(target=run_flask, daemon=True).start()
-        print("🚀 Flaskサーバー起動完了 (/gmail/callback 有効)")
+            threading.Thread(target=run_flask, daemon=True).start()
+        except Exception as e:
+            print(f"❌ Flask 起動失敗: {e}")
+            traceback.print_exc()
 
-
-    # ✅ プログラム終了防止 （Slack＋感知スレッド維持用）
-    print("\n🕒 プログラムはバックグラウンドで実行中です。Ctrl+Cで終了できます。")
+    # ✅ プログラム継続用スリープ
+    print("🕒 バックグラウンドで実行中。Slack と Gmail 感知維持中...")
     try:
         while True:
             time.sleep(10)
     except KeyboardInterrupt:
-        print("🛑 手動で終了されました。")
+        print("🛑 手動終了されました。")
+
