@@ -771,22 +771,43 @@ def gmail_callback():
     """
 
 def get_last_history_id(email):
-    path = f"history_id_{email}.txt"
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            return f.read().strip()
-    return None
+    import gspread
+    from google.oauth2.service_account import Credentials
+    import os, json
+
+    credentials = Credentials.from_service_account_info(
+        json.loads(os.getenv("GCP_SERVICE_ACCOUNT_JSON")),
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    client = gspread.authorize(credentials)
+    sheet = client.open_by_key(os.getenv("GSHEET_ID")).worksheet("history")
+
+    try:
+        cell = sheet.find(email)
+        return sheet.cell(cell.row, cell.col + 1).value  # B열 = history_id
+    except gspread.exceptions.CellNotFound:
+        return None
+
 
 def save_last_history_id(email, history_id):
-    path = f"history_id_{email}.txt"
+    import gspread
+    from google.oauth2.service_account import Credentials
+    import os, json
 
-    prev_id = None
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            prev_id = f.read().strip()
+    credentials = Credentials.from_service_account_info(
+        json.loads(os.getenv("GCP_SERVICE_ACCOUNT_JSON")),
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    client = gspread.authorize(credentials)
+    sheet = client.open_by_key(os.getenv("GSHEET_ID")).worksheet("history")
 
-    with open(path, "w") as f:
-        f.write(str(history_id))
+    try:
+        cell = sheet.find(email)
+        prev_id = sheet.cell(cell.row, cell.col + 1).value
+        sheet.update_cell(cell.row, cell.col + 1, str(history_id))
+    except gspread.exceptions.CellNotFound:
+        prev_id = None
+        sheet.append_row([email, str(history_id)])
 
     if prev_id != str(history_id):
         print(f"📗 [HISTORY ID] {email} 更新: {history_id}")
