@@ -1,3 +1,4 @@
+print("✅ chatbot_auto.py 実行開始")
 import os, json, time, threading
 import requests, base64
 from dotenv import load_dotenv
