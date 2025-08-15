@@ -22,5 +22,4 @@ COPY . .
 # Railway の正常性監視のため Flask を有効化
 ENV USE_FLASK=true
 
-# 実行。ファイル名は実際のスクリプト名に合わせて変更
-CMD ["python", "-u", "chatbot_auto.py"]
+CMD ["python", "-u", "chatbot.py"]
