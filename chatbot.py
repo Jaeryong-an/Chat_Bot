@@ -1645,7 +1645,7 @@ def start_auto_gmail_checker():
     threading.Thread(target=loop, daemon=True).start()
 
 if __name__ == "__main__":
-    print("✅ chatbot_auto.py 実行開始")
+    print("✅ chatbot.py 実行開始")
     try:
         _zendesk_env_guard()
         _zendesk_boot_healthcheck()
