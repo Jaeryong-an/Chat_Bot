@@ -175,16 +175,34 @@ def safe_post_to_slack(client: WebClient, **kwargs):
 # ──────────────────────────────────────────────────────────────────────────────
 # 3) GSheet 헬퍼 (서비스계정 JSON env 로 단일화)
 # ──────────────────────────────────────────────────────────────────────────────
+def _extract_sheet_id(raw: str) -> str:
+    s = (raw or "").strip().strip('"').strip("'")
+    m = re.search(r"/spreadsheets/d/([A-Za-z0-9-_]+)", s)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r"[A-Za-z0-9-_]{25,}", s):
+        return s
+    raise RuntimeError(f"GSHEET_ID malformed: {s!r}")
+
 def _gspread_open():
-    creds_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
-    if not creds_json:
+    raw = os.getenv("GCP_SERVICE_ACCOUNT_JSON", "")
+    if not raw:
         raise RuntimeError("GCP_SERVICE_ACCOUNT_JSON env가 비어 있습니다.")
+    try:
+        data = json.loads(raw) if raw.lstrip().startswith("{") else json.loads(
+            base64.b64decode(raw).decode("utf-8"))
+    except Exception:
+        # 실제 개행을 \n으로 치환하여 재시도
+        data = json.loads(re.sub(r"\r?\n", r"\\n", raw))
+
     credentials = Credentials.from_service_account_info(
-        json.loads(creds_json),
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        data, scopes=["https://www.googleapis.com/auth/spreadsheets"]
     )
     gc = gspread.authorize(credentials)
-    sh = gc.open_by_key(os.getenv("GSHEET_ID"))
+
+    sid = _extract_sheet_id(os.getenv("GSHEET_ID"))
+    print(f"[GSheet] using key: {sid[:6]}...{sid[-6:]}", flush=True)
+    sh = gc.open_by_key(sid)
     return gc, sh
 
 def _get_ws(sheet_name: str, headers: Optional[list] = None):
