@@ -1579,22 +1579,19 @@ def archive_gmail_to_slack_channel(keyword):
         print(f"[⚠️ Slack 転送失敗] {e}")
 
 def _load_gmail_accounts():
-    """Railway ではファイル配置が難しいため、環境変数 GMAIL_ACCOUNTS_JSON からも読み込む"""
-    env_json = os.getenv("GMAIL_ACCOUNTS_JSON")
-    if env_json:
-        try:
-            data = json.loads(env_json)
-            accts = data.get("accounts", [])
-            if isinstance(accts, dict):
-                accts = [accts]
-            return accts
-        except Exception:
-            return []
-    try:
-        with open("_load_gmail_accounts()") as f:
-            return json.load(f).get("accounts", [])
-    except Exception:
+    raw = os.getenv("GMAIL_ACCOUNTS_JSON", "").strip()
+    print(f"[GML] env len={len(raw)} start={raw[:30]!r}", flush=True)
+    if not raw:
         return []
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        print(f"[GML] JSON error: {e}", flush=True)
+        return []
+    accts = data.get("accounts", [])
+    if isinstance(accts, dict):
+        accts = [accts]
+    return accts if isinstance(accts, list) else []
 
 def _search_gmail_first_account(keyword: str) -> str:
     try:
