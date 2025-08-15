@@ -8,7 +8,7 @@ import traceback
 # 1) .env 먼저 로드
 # ──────────────────────────────────────────────────────────────────────────────
 from dotenv import load_dotenv
-load_dotenv(dotenv_path=".env", override=True)
+load_dotenv(dotenv_path=".env", override=False)
 
 import requests
 from requests.adapters import HTTPAdapter
