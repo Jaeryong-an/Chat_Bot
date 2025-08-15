@@ -203,6 +203,7 @@ def _gspread_open():
     print(f"[GSheet] SA JSON startswith '{{' ? {raw.lstrip().startswith('{')}", flush=True)
 
     data = _parse_service_account(raw)
+    print(f"[GSheet] sa_email = {data.get('client_email')}", flush=True)
     creds = Credentials.from_service_account_info(
         data, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     gc = gspread.authorize(creds)
@@ -212,6 +213,8 @@ def _gspread_open():
 
     try:
         sh = gc.open_by_key(sid)
+        print(f"[GSheet] sheet.title = {sh.title}", flush=True)
+        print(f"[GSheet] worksheets = {[w.title for w in sh.worksheets()]}", flush=True)
     except Exception as e:
         print(f"[GSheet] open_by_key failed: {e.__class__.__name__}: {e}", flush=True)
         print(traceback.format_exc(), flush=True)
