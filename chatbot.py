@@ -176,36 +176,50 @@ def safe_post_to_slack(client: WebClient, **kwargs):
 # 3) GSheet 헬퍼 (서비스계정 JSON env 로 단일화)
 # ──────────────────────────────────────────────────────────────────────────────
 def _extract_sheet_id(raw: str) -> str:
-    print(f"[GSheet] _extract input = {repr(raw)}", flush=True)
     s = (raw or "").strip().strip('"').strip("'")
     # URL이면 키만 추출
     m = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]+)", s)
     key = m.group(1) if m else s
-    # 허용문자만 남김(제로폭 등 제거)
+    # 제어문자/제로폭 제거
     key = "".join(ch for ch in key if ch.isalnum() or ch in "-_")
-    print(f"[GSheet] _extract output key = {repr(key)}", flush=True)
     if not re.fullmatch(r"[A-Za-z0-9_-]{25,}", key):
         raise RuntimeError(f"GSHEET_ID malformed: {repr(s)} -> {repr(key)}")
     return key
 
-def _gspread_open():
-    print(f"[GSheet] env GSHEET_ID = {repr(os.getenv('GSHEET_ID'))}", flush=True)
-    raw = os.getenv("GCP_SERVICE_ACCOUNT_JSON", "")
-    print(f"[GSheet] SA JSON startswith '{{' ? {raw.lstrip().startswith('{')}", flush=True)
+def _parse_service_account(raw: str) -> dict:
     if not raw:
         raise RuntimeError("GCP_SERVICE_ACCOUNT_JSON empty")
     try:
-        data = json.loads(raw) if raw.lstrip().startswith("{") else json.loads(base64.b64decode(raw).decode("utf-8"))
+        return json.loads(raw) if raw.lstrip().startswith("{") else json.loads(
+            base64.b64decode(raw).decode("utf-8"))
     except Exception:
-        data = json.loads(re.sub(r"\r?\n", r"\\n", raw))
+        return json.loads(re.sub(r"\r?\n", r"\\n", raw))
 
+def _gspread_open():
+    # 디버그 로그
+    env_val = os.getenv("GSHEET_ID")
+    print(f"[GSheet] env GSHEET_ID = {repr(env_val)}", flush=True)
+    raw = os.getenv("GCP_SERVICE_ACCOUNT_JSON", "")
+    print(f"[GSheet] SA JSON startswith '{{' ? {raw.lstrip().startswith('{')}", flush=True)
+
+    data = _parse_service_account(raw)
     creds = Credentials.from_service_account_info(
         data, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     gc = gspread.authorize(creds)
 
-    sid = _extract_sheet_id(os.getenv("GSHEET_ID"))
-    print(f"[GSheet] key={sid!r}", flush=True)
-    sh = gc.open_by_key(sid)   # open_by_url 금지
+    sid = _extract_sheet_id(env_val)
+    print(f"[GSheet] using key = {sid}", flush=True)
+
+    try:
+        sh = gc.open_by_key(sid)
+    except Exception as e:
+        print(f"[GSheet] open_by_key failed: {e.__class__.__name__}: {e}", flush=True)
+        print(traceback.format_exc(), flush=True)
+        # 폴백: 키로 URL 구성 후 시도
+        url = f"https://docs.google.com/spreadsheets/d/{sid}/edit"
+        print(f"[GSheet] fallback open_by_url: {url}", flush=True)
+        sh = gc.open_by_url(url)
+
     return gc, sh
 
 def _get_ws(sheet_name: str, headers: Optional[list] = None):
