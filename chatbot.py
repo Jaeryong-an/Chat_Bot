@@ -177,10 +177,8 @@ def safe_post_to_slack(client: WebClient, **kwargs):
 # ──────────────────────────────────────────────────────────────────────────────
 def _extract_sheet_id(raw: str) -> str:
     s = (raw or "").strip().strip('"').strip("'")
-    # URL이면 키만 추출
     m = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]+)", s)
     key = m.group(1) if m else s
-    # 제어문자/제로폭 제거
     key = "".join(ch for ch in key if ch.isalnum() or ch in "-_")
     if not re.fullmatch(r"[A-Za-z0-9_-]{25,}", key):
         raise RuntimeError(f"GSHEET_ID malformed: {repr(s)} -> {repr(key)}")
@@ -190,35 +188,30 @@ def _parse_service_account(raw: str) -> dict:
     if not raw:
         raise RuntimeError("GCP_SERVICE_ACCOUNT_JSON empty")
     try:
-        return json.loads(raw) if raw.lstrip().startswith("{") else json.loads(
-            base64.b64decode(raw).decode("utf-8"))
+        return json.loads(raw) if raw.lstrip().startswith("{") else json.loads(base64.b64decode(raw).decode("utf-8"))
     except Exception:
         return json.loads(re.sub(r"\r?\n", r"\\n", raw))
 
 def _gspread_open():
-    # 디버그 로그
     env_val = os.getenv("GSHEET_ID")
     print(f"[GSheet] env GSHEET_ID = {repr(env_val)}", flush=True)
-    raw = os.getenv("GCP_SERVICE_ACCOUNT_JSON", "")
-    print(f"[GSheet] SA JSON startswith '{{' ? {raw.lstrip().startswith('{')}", flush=True)
 
-    data = _parse_service_account(raw)
+    data = _parse_service_account(os.getenv("GCP_SERVICE_ACCOUNT_JSON",""))
     print(f"[GSheet] sa_email = {data.get('client_email')}", flush=True)
+
     creds = Credentials.from_service_account_info(
         data, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     gc = gspread.authorize(creds)
 
     sid = _extract_sheet_id(env_val)
-    print(f"[GSheet] using key = {sid}", flush=True)
+    print(f"[GSheet] using key = {sid} (len={len(sid)})", flush=True)
 
     try:
         sh = gc.open_by_key(sid)
         print(f"[GSheet] sheet.title = {sh.title}", flush=True)
-        print(f"[GSheet] worksheets = {[w.title for w in sh.worksheets()]}", flush=True)
     except Exception as e:
         print(f"[GSheet] open_by_key failed: {e.__class__.__name__}: {e}", flush=True)
         print(traceback.format_exc(), flush=True)
-        # 폴백: 키로 URL 구성 후 시도
         url = f"https://docs.google.com/spreadsheets/d/{sid}/edit"
         print(f"[GSheet] fallback open_by_url: {url}", flush=True)
         sh = gc.open_by_url(url)
@@ -246,7 +239,9 @@ def save_feedback_to_gsheet(faq_id, question, user_id, feedback, comment=""):
         ws.append_row([now, user_id, faq_id, question, feedback, comment])
         print(f"[✅ GSheet] {faq_id} - {feedback} saved")
     except Exception as e:
-        print(f"[❌ GSheet ERROR] {str(e)}")
+        import traceback
+        print(f"[❌ GSheet ERROR] {e.__class__.__name__}: {e}")
+        print(traceback.format_exc())
 
 # ───── gspread safe helpers ─────
 def _ws_find_safe(ws, value, *, in_column=1):
