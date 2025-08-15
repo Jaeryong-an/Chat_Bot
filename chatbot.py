@@ -427,41 +427,6 @@ def refresh_gmail_token_for(refresh_token):
         print("❌ Token refresh failed:", res.text)
         return None
 
-def _gmail_diag_once():
-    try:
-        accts = _load_gmail_accounts()
-        print(f"[GML] accounts={len(accts)}")
-        if not accts:
-            return
-        rt = accts[0]["refresh_token"]
-        at = refresh_gmail_token_for(rt)
-        print(f"[GML] token_ok={bool(at)}")
-        if not at:
-            return
-        headers = {"Authorization": f"Bearer {at}"}
-
-        # 프로필
-        r = http_get("https://gmail.googleapis.com/gmail/v1/users/me/profile", headers=headers)
-        print(f"[GML] profile_status={r.status_code} body={r.text[:120]}")
-
-        # 최근 7일 목록(라벨필터 포함)
-        filt = os.getenv("GMAIL_LABEL_FILTER", "").strip()
-        q = f"newer_than:7d -in:spam -in:trash" + (f' label:\"{filt}\"' if filt else "")
-        r = http_get("https://gmail.googleapis.com/gmail/v1/users/me/messages",
-                     headers=headers, params={"q": q, "maxResults": 10})
-        data = r.json() if r.status_code == 200 else {}
-        print(f"[GML] list_status={r.status_code} q={q} count={len(data.get('messages',[]) or [])} next={bool(data.get('nextPageToken'))}")
-
-        # 샘플 1건 상세
-        if (data.get("messages") or []):
-            mid = data["messages"][0]["id"]
-            d = http_get(f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{mid}", headers=headers)
-            print(f"[GML] detail_status={d.status_code}")
-    except Exception as e:
-        import traceback
-        print(f"[GML] DIAG_ERR {e.__class__.__name__}: {e}")
-        print(traceback.format_exc())
-
 def _decode_b64_text(data: str) -> str:
     if not data:
         return ""
@@ -1579,19 +1544,22 @@ def archive_gmail_to_slack_channel(keyword):
         print(f"[⚠️ Slack 転送失敗] {e}")
 
 def _load_gmail_accounts():
-    raw = os.getenv("GMAIL_ACCOUNTS_JSON", "").strip()
-    print(f"[GML] env len={len(raw)} start={raw[:30]!r}", flush=True)
-    if not raw:
-        return []
+    """Railway ではファイル配置が難しいため、環境変数 GMAIL_ACCOUNTS_JSON からも読み込む"""
+    env_json = os.getenv("GMAIL_ACCOUNTS_JSON")
+    if env_json:
+        try:
+            data = json.loads(env_json)
+            accts = data.get("accounts", [])
+            if isinstance(accts, dict):
+                accts = [accts]
+            return accts
+        except Exception:
+            return []
     try:
-        data = json.loads(raw)
-    except Exception as e:
-        print(f"[GML] JSON error: {e}", flush=True)
+        with open("_load_gmail_accounts()") as f:
+            return json.load(f).get("accounts", [])
+    except Exception:
         return []
-    accts = data.get("accounts", [])
-    if isinstance(accts, dict):
-        accts = [accts]
-    return accts if isinstance(accts, list) else []
 
 def _search_gmail_first_account(keyword: str) -> str:
     try:
@@ -1737,7 +1705,6 @@ if __name__ == "__main__":
     # Gmail 메일 수집
     try:
         print("📬 Gmail メール取得開始")
-        _gmail_diag_once()
 
         today = datetime.now(JST).date()
         default_start = today - timedelta(days=7)
