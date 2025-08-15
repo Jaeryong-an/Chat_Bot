@@ -4,11 +4,11 @@ from collections import Counter
 from datetime import datetime
 import calendar
 
-# === 설정 ===
+# === 設定 ===
 SPREADSHEET_ID = "103F0opvu-DK-SoR4Gz_U6IIKYLwXDgfklet3TUZxYd4"
 SHEET_NAME = "feedback"
 
-# === 인증 ===
+# === 　認証 ===
 credentials = Credentials.from_service_account_file(
     "gcp_service_account.json",
     scopes=["https://www.googleapis.com/auth/spreadsheets"]
@@ -16,19 +16,19 @@ credentials = Credentials.from_service_account_file(
 gc = gspread.authorize(credentials)
 ws = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
 
-# === 데이터 불러오기 ===
+# === データ呼び込み ===
 data = ws.get_all_values()
 headers = data[0]
 rows = data[1:]
 
-# 열 인덱스 파악
+# 列
 idx_date = headers.index("timestamp")
 idx_user = headers.index("user_id")
 idx_faq = headers.index("faq_id")
 idx_feedback = headers.index("feedback")
 idx_comment = headers.index("comment")
 
-# === 이번 달 기준 날짜 필터 ===
+# === 今月基準フィルター ===
 now = datetime.now()
 this_month = now.month
 this_year = now.year
@@ -42,7 +42,7 @@ for row in rows:
     except:
         continue
 
-# === 통계 계산 ===
+# === 統計 計算 ===
 total_yes = sum(1 for r in filtered if r[idx_feedback].strip().lower() == "yes")
 total_no = sum(1 for r in filtered if r[idx_feedback].strip().lower() == "no")
 no_with_comment = sum(1 for r in filtered if r[idx_feedback].strip().lower() == "no" and r[idx_comment].strip() != "")
@@ -50,7 +50,7 @@ no_with_comment = sum(1 for r in filtered if r[idx_feedback].strip().lower() == 
 faq_counter = Counter(r[idx_faq] for r in filtered)
 top_faq = faq_counter.most_common(1)[0][0] if faq_counter else "なし"
 
-# === 출력 ===
+# === 出力 ===
 month_ja = f"{this_month}月"
 print("📊 月間フィードバックレポート")
 print(f"🗓️ 対象月: {month_ja}")
