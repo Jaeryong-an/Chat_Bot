@@ -194,28 +194,17 @@ def _parse_service_account(raw: str) -> dict:
 
 def _gspread_open():
     env_val = os.getenv("GSHEET_ID")
-    print(f"[GSheet] env GSHEET_ID = {repr(env_val)}", flush=True)
-
     data = _parse_service_account(os.getenv("GCP_SERVICE_ACCOUNT_JSON",""))
-    print(f"[GSheet] sa_email = {data.get('client_email')}", flush=True)
-
     creds = Credentials.from_service_account_info(
         data, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     gc = gspread.authorize(creds)
 
     sid = _extract_sheet_id(env_val)
-    print(f"[GSheet] using key = {sid} (len={len(sid)})", flush=True)
-
     try:
         sh = gc.open_by_key(sid)
-        print(f"[GSheet] sheet.title = {sh.title}", flush=True)
-    except Exception as e:
-        print(f"[GSheet] open_by_key failed: {e.__class__.__name__}: {e}", flush=True)
-        print(traceback.format_exc(), flush=True)
+    except Exception:
         url = f"https://docs.google.com/spreadsheets/d/{sid}/edit"
-        print(f"[GSheet] fallback open_by_url: {url}", flush=True)
         sh = gc.open_by_url(url)
-
     return gc, sh
 
 def _get_ws(sheet_name: str, headers: Optional[list] = None):
