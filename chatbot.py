@@ -1523,7 +1523,7 @@ def _load_gmail_accounts():
         except Exception:
             return []
     try:
-        with open("gmail_accounts.json") as f:
+        with open("_load_gmail_accounts()") as f:
             return json.load(f).get("accounts", [])
     except Exception:
         return []
@@ -1634,7 +1634,7 @@ def start_auto_gmail_checker():
                     print("❌ 'accounts' フィールドがリスト形式ではありません")
                     accounts = []
             except Exception as e:
-                print(f"❌ gmail_accounts.json 読み込み失敗: {e}")
+                print(f"❌ _load_gmail_accounts() 読み込み失敗: {e}")
                 accounts = []
 
             # 各アカウントの新着チェック
