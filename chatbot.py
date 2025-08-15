@@ -1515,7 +1515,11 @@ def _load_gmail_accounts():
     env_json = os.getenv("GMAIL_ACCOUNTS_JSON")
     if env_json:
         try:
-            return json.loads(env_json).get("accounts", [])
+            data = json.loads(env_json)
+            accts = data.get("accounts", [])
+            if isinstance(accts, dict):
+                accts = [accts]
+            return accts
         except Exception:
             return []
     try:
@@ -1672,9 +1676,12 @@ if __name__ == "__main__":
         today = datetime.now(JST).date()
         default_start = today - timedelta(days=7)
 
-        with open("gmail_accounts.json") as f:
-            config = json.load(f)
-        accounts = config.get("accounts", [])
+        accounts = _load_gmail_accounts()
+        if isinstance(accounts, dict):  # 단일 객체도 허용
+            accounts = [accounts]
+        if not accounts:
+            print("⚠️ Gmailアカウント未設定。メール収集をスキップ")
+            accounts = []
 
         for acct in accounts:
             email = acct["email"]
