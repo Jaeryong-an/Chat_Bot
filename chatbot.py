@@ -176,18 +176,22 @@ def safe_post_to_slack(client: WebClient, **kwargs):
 # 3) GSheet 헬퍼 (서비스계정 JSON env 로 단일화)
 # ──────────────────────────────────────────────────────────────────────────────
 def _extract_sheet_id(raw: str) -> str:
+    print(f"[GSheet] _extract input = {repr(raw)}", flush=True)
     s = (raw or "").strip().strip('"').strip("'")
     # URL이면 키만 추출
     m = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]+)", s)
     key = m.group(1) if m else s
     # 허용문자만 남김(제로폭 등 제거)
     key = "".join(ch for ch in key if ch.isalnum() or ch in "-_")
+    print(f"[GSheet] _extract output key = {repr(key)}", flush=True)
     if not re.fullmatch(r"[A-Za-z0-9_-]{25,}", key):
         raise RuntimeError(f"GSHEET_ID malformed: {repr(s)} -> {repr(key)}")
     return key
 
 def _gspread_open():
+    print(f"[GSheet] env GSHEET_ID = {repr(os.getenv('GSHEET_ID'))}", flush=True)
     raw = os.getenv("GCP_SERVICE_ACCOUNT_JSON", "")
+    print(f"[GSheet] SA JSON startswith '{{' ? {raw.lstrip().startswith('{')}", flush=True)
     if not raw:
         raise RuntimeError("GCP_SERVICE_ACCOUNT_JSON empty")
     try:
