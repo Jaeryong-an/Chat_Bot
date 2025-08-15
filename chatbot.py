@@ -195,14 +195,14 @@ def _gspread_open():
         # 실제 개행을 \n으로 치환하여 재시도
         data = json.loads(re.sub(r"\r?\n", r"\\n", raw))
 
-    credentials = Credentials.from_service_account_info(
-        data, scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
+    creds_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
+    credentials = Credentials.from_service_account_info(json.loads(creds_json),
+        scopes=["https://www.googleapis.com/auth/spreadsheets"])
     gc = gspread.authorize(credentials)
 
-    sid = _extract_sheet_id(os.getenv("GSHEET_ID"))
+    sid = (os.getenv("GSHEET_ID") or "").strip().strip('"').strip("'")
     print(f"[GSheet] using key: {sid[:6]}...{sid[-6:]}", flush=True)
-    sh = gc.open_by_key(sid)
+    sh = gc.open_by_url(sid) if sid.startswith("http") else gc.open_by_key(sid)
     return gc, sh
 
 def _get_ws(sheet_name: str, headers: Optional[list] = None):
