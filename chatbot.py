@@ -177,32 +177,31 @@ def safe_post_to_slack(client: WebClient, **kwargs):
 # ──────────────────────────────────────────────────────────────────────────────
 def _extract_sheet_id(raw: str) -> str:
     s = (raw or "").strip().strip('"').strip("'")
-    m = re.search(r"/spreadsheets/d/([A-Za-z0-9-_]+)", s)
-    if m:
-        return m.group(1)
-    if re.fullmatch(r"[A-Za-z0-9-_]{25,}", s):
-        return s
-    raise RuntimeError(f"GSHEET_ID malformed: {s!r}")
+    # URL이면 키만 추출
+    m = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]+)", s)
+    key = m.group(1) if m else s
+    # 허용문자만 남김(제로폭 등 제거)
+    key = "".join(ch for ch in key if ch.isalnum() or ch in "-_")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{25,}", key):
+        raise RuntimeError(f"GSHEET_ID malformed: {repr(s)} -> {repr(key)}")
+    return key
 
 def _gspread_open():
     raw = os.getenv("GCP_SERVICE_ACCOUNT_JSON", "")
     if not raw:
-        raise RuntimeError("GCP_SERVICE_ACCOUNT_JSON env가 비어 있습니다.")
+        raise RuntimeError("GCP_SERVICE_ACCOUNT_JSON empty")
     try:
-        data = json.loads(raw) if raw.lstrip().startswith("{") else json.loads(
-            base64.b64decode(raw).decode("utf-8"))
+        data = json.loads(raw) if raw.lstrip().startswith("{") else json.loads(base64.b64decode(raw).decode("utf-8"))
     except Exception:
-        # 실제 개행을 \n으로 치환하여 재시도
         data = json.loads(re.sub(r"\r?\n", r"\\n", raw))
 
-    creds_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
-    credentials = Credentials.from_service_account_info(json.loads(creds_json),
-        scopes=["https://www.googleapis.com/auth/spreadsheets"])
-    gc = gspread.authorize(credentials)
+    creds = Credentials.from_service_account_info(
+        data, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    gc = gspread.authorize(creds)
 
-    sid = (os.getenv("GSHEET_ID") or "").strip().strip('"').strip("'")
-    print(f"[GSheet] using key: {sid[:6]}...{sid[-6:]}", flush=True)
-    sh = gc.open_by_url(sid) if sid.startswith("http") else gc.open_by_key(sid)
+    sid = _extract_sheet_id(os.getenv("GSHEET_ID"))
+    print(f"[GSheet] key={sid!r}", flush=True)
+    sh = gc.open_by_key(sid)   # open_by_url 금지
     return gc, sh
 
 def _get_ws(sheet_name: str, headers: Optional[list] = None):
