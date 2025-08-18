@@ -1,6 +1,6 @@
 import os, json, time, threading, base64, re
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Any, List
 from functools import lru_cache
 import traceback
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
@@ -1070,7 +1070,7 @@ def handle_feedback_no(ack, body, say, client):
 def correct_typo_with_gpt(input_text: str) -> str:
     try:
         r = OAI.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-5",
             messages=[
                 {"role": "system", "content":
                  "あなたは日本語のスペルチェッカーです。\n"
@@ -1089,7 +1089,7 @@ def correct_typo_with_gpt(input_text: str) -> str:
 def extract_keywords_ai(q: str) -> str:
     try:
         r = OAI.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-5",
             messages=[
                 {"role":"system","content":
                  "与えられた文から検索用のキーワードを3〜8個抽出して、日本語/英語のままカンマ区切りで返す。説明不要。"},
@@ -1187,6 +1187,82 @@ def _nohit_text(x):
         return "⚠️ 取得に失敗しました。"
     return "🙅 該当なし"
 
+def _to_text(name: str, val: Any, limit_items: int = 10, limit_chars: int = 2000) -> str:
+    """各プラットフォームの結果を文字列化してコンパクト化"""
+    if val is None:
+        return ""
+    # 取得失敗センチネル
+    if isinstance(val, str) and val in ("__ERR__", "__ERR_TIMEOUT__"):
+        return f"[{name}] 取得失敗"
+
+    # リスト → 箇条書き 先頭N件
+    if isinstance(val, list):
+        items = [str(x) for x in val[:limit_items]]
+        text = "\n".join(f"• {x}" for x in items)
+        return f"[{name}]\n{text}" if items else ""
+
+    # 文字列その他
+    s = str(val)
+    if not s.strip():
+        return ""
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > limit_chars:
+        s = s[: limit_chars - 1] + "…"
+    return f"[{name}] {s}"
+
+
+# ─────────────────────────────────────────────────────────────
+# 要約呼び出し
+# ─────────────────────────────────────────────────────────────
+
+def summarize_search_outputs_ja(query: str, notion: Any, zendesk: Any, slack: Any, gmail: Any, max_tokens: int = 300) -> str:
+    """検索結果を日本語で5行以内の箇条書きに要約"""
+    pieces = [
+        _to_text("Notion", notion),
+        _to_text("Zendesk", zendesk),
+        _to_text("Slack", slack),
+        _to_text("Gmail", gmail),
+    ]
+    context = "\n\n".join([p for p in pieces if p])
+    if not context:
+        return "（要約対象の結果がありません）"
+
+    system = (
+        "あなたは社内検索結果を正確かつ簡潔に整形するアシスタントです。"
+        "推測せず事実のみを要約し、指定フォーマットに厳密に従います。"
+    )
+
+    user = (
+        "次の検索結果を基に各プラットフォームの要点を日本語で1文ずつ要約してください。\n\n"
+        "【出力フォーマット（厳守。余計な行・記号・空白を追加しない）】\n"
+        "1. Notion：「…」\n"
+        "2. Zendesk：「…」\n"
+        "3. Slack・Gmail：「…」\n\n"
+        "【制約】\n"
+        "- 各「…」は1文・最大50文字。絵文字・箇条書き・強調記号は使わない。\n"
+        "- 情報が乏しい/見つからない場合は「該当なし」と書く。\n"
+        "- SlackとGmailは統合し要点を1文で示す。\n"
+        "- 推測不可。不明点は「不明」。\n\n"
+        f"[Notion]\n{_to_text('Notion', notion)}\n\n"
+        f"[Zendesk]\n{_to_text('Zendesk', zendesk)}\n\n"
+        f"[Slack]\n{_to_text('Slack', slack)}\n\n"
+        f"[Gmail]\n{_to_text('Gmail', gmail)}\n"
+    )
+
+    try:
+        resp = openai.ChatCompletion.create(
+            model=OPENAI_MODEL_SUMMARY,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.2,
+            max_tokens=max_tokens,
+        )
+        return resp["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        return f"（要約失敗: {type(e).__name__}: {e}）"
+
 @slack_app.event("app_mention")
 def handle_mention_events(body, say):
     text = body.get("event", {}).get("text", "")
@@ -1234,6 +1310,10 @@ def handle_mention_events(body, say):
                 zendesk_result_text = _zendesk_lines_to_text(_z_rows)
                 slack_result = _await("slack", futs2["slack"], SLACK_TIMEOUT)
                 gmail_result = _await("gmail", futs2["gmail"], 15)
+    
+    summary_ja = summarize_search_outputs_ja(
+        corrected_query, faq_result, zendesk_result_text, slack_result, gmail_result
+    )
 
     # 3섹션으로 출력
     notion_txt  = f"1. Notion：\n{faq_result if not _nohit_or_err(faq_result) else _nohit_text(faq_result)}"
@@ -1258,7 +1338,7 @@ def handle_mention_events(body, say):
         sg_parts.append(f"• *Gmail*\n{_nohit_text(gmail_result)}")
     sg_txt = "3. Slack・Gmail：\n" + "\n".join(sg_parts)
 
-    combined = f"{notion_txt}\n\n{zendesk_txt}\n\n{sg_txt}"
+    combined = f"0. 要約：\n{summary_ja}\n\n{notion_txt}\n\n{zendesk_txt}\n\n{sg_txt}"
 
     send_faq_with_feedback(
         say,
