@@ -1043,6 +1043,18 @@ def _zendesk_queries(keyword: str):
         qs.append(" ".join(starred))
     return qs
 
+# ── 追加: LLM用エビデンス作成ヘルパ
+def _sg_hit(x):  # not nohit
+    return not _nohit_or_err(x)
+
+def _zendesk_evidence(rows, max_chars=400):
+    s = "; ".join(f"#{r['id']} {r['subject']} [status:{r['status']}]" for r in rows)
+    return s[:max_chars]
+
+def _decorate_with_count(text_or_empty: str, count: int) -> str:
+    base = (text_or_empty or "").strip()
+    return f"【件数:{count}】 " + (base if count > 0 else "")
+
 def _zendesk_search_all(url, auth, query, max_pages=3):
     items, page = [], 0
     page_url = None
@@ -1365,7 +1377,7 @@ def reminder_or_autosave(session_key, user_id, faq_id, question, client):
             print(f"❌ Google Sheets 保存失敗: {e}")
         try:
             client.chat_postMessage(
-                channel="feedback-momentum",
+                channel=_channel_id("SLACK_CHANNEL_FEEDBACK"),
                 text=(f"📝 フィードバック（自動保存）\n"
                       f"*質問:* {question}\n"
                       f"*ユーザー:* <@{user_id}>\n"
@@ -1400,7 +1412,7 @@ def handle_additional_comment(body, say, client):
 
         save_feedback_to_gsheet(faq_id, question, user, "no", comment=text)
         client.chat_postMessage(
-            channel="feedback-momentum",
+            channel=_channel_id("SLACK_CHANNEL_FEEDBACK"),
             text=(f"📝 フィードバックコメント受信\n"
                   f"*質問:* {question}\n"
                   f"*ユーザー:* <@{user}>\n"
@@ -1469,7 +1481,6 @@ import os
 OPENAI_MODEL_SUMMARY = os.getenv("OPENAI_MODEL_SUMMARY", "gpt-4o")
 
 def summarize_search_outputs_ja(query: str, notion: Any, zendesk: Any, slack: Any, gmail: Any, max_tokens: int = 300) -> str:
-    """検索結果を日本語で5行以内の箇条書きに要約"""
     pieces = [
         _to_text("Notion", notion),
         _to_text("Zendesk", zendesk),
@@ -1481,37 +1492,29 @@ def summarize_search_outputs_ja(query: str, notion: Any, zendesk: Any, slack: An
         return "（要約対象の結果がありません）"
 
     system = (
-        "あなたは社内検索結果を正確かつ簡潔に整形するアシスタントです。"
-        "推測せず事実のみを要約し、指定フォーマットに厳密に従います。"
+        "あなたは社内検索結果を厳密に整形するアシスタント。"
+        "各プラットフォーム入力の先頭に『【件数:N】』が付く。N>0のときは『該当なし』という語を出してはならない。"
+        "URLは無視し、事実のみを50字以内で要点化せよ。"
     )
-
     user = (
-        "次の検索結果を基に各プラットフォームの要点を日本語で1文ずつ要約してください。\n\n"
-        "【出力フォーマット（厳守。余計な行・記号・空白を追加しない）】\n"
+        "次の検索結果を基に各プラットフォームを1文で要約せよ。\n\n"
+        "【出力フォーマット】\n"
         "1. Notion：「…」\n"
         "2. Zendesk：「…」\n"
         "3. Slack・Gmail：「…」\n\n"
         "【制約】\n"
-        "- 各「…」は1文・最大50文字。絵文字・箇条書き・強調記号は使わない。\n"
-        "- 情報が乏しい/見つからない場合は「該当なし」と書く。\n"
-        "- SlackとGmailは統合し要点を1文で示す。\n"
-        "- 推測不可。不明点は「不明」。\n\n"
+        "- 各文50字以内。装飾禁止。N=0のときのみ『該当なし』と書く。\n\n"
         f"[Notion]\n{_to_text('Notion', notion)}\n\n"
         f"[Zendesk]\n{_to_text('Zendesk', zendesk)}\n\n"
         f"[Slack]\n{_to_text('Slack', slack)}\n\n"
         f"[Gmail]\n{_to_text('Gmail', gmail)}\n"
     )
-
     try:
         resp = OAI.chat.completions.create(
             model=OPENAI_MODEL_SUMMARY,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            messages=[{"role":"system","content":system},{"role":"user","content":user}],
             temperature=0.2,
             max_tokens=max_tokens,
-            timeout=20,
         )
         return resp.choices[0].message.content.strip()
     except Exception as e:
@@ -1565,6 +1568,7 @@ def handle_mention_events(body, say):
     print(f"[SEARCH] dispatch sources=notion,zendesk,slack q='{corrected_query}'", flush=True)
     say(text="🔎 検索中です。少々お待ちください...")
 
+    # ── 検索
     with ThreadPoolExecutor(max_workers=6) as ex:
         futs = {
             "faq":   ex.submit(search_notion_faq, corrected_query),
@@ -1574,13 +1578,12 @@ def handle_mention_events(body, say):
         }
         faq_result   = _await("faq",   futs["faq"],   15)
         _z_blocks    = _await("zblk",  futs["zblk"],  15) or []
-        _z_rows = _zendesk_blocks_to_lines(_z_blocks, limit=3)
+        _z_rows      = _zendesk_blocks_to_lines(_z_blocks, limit=3)
         zendesk_result_text = _zendesk_lines_to_text(_z_rows)
         slack_result = _await("slack", futs["slack"], SLACK_TIMEOUT)
         gmail_result = _await("gmail", futs["gmail"], 15)
 
-
-    # 무히트면 2차: 키워드 압축 후 병렬 재검색
+    # ── 無ヒット時の再検索
     if all(_nohit_or_err(x) for x in [faq_result, zendesk_result_text, slack_result, gmail_result]):
         ai_kws = extract_keywords_ai(corrected_query)
         kw2 = ai_kws or corrected_query
@@ -1595,48 +1598,44 @@ def handle_mention_events(body, say):
                 }
                 faq_result   = _await("faq",   futs2["faq"],   15)
                 _z_blocks    = _await("zblk",  futs2["zblk"],  15) or []
-                _z_rows = _zendesk_blocks_to_lines(_z_blocks, limit=3)
+                _z_rows      = _zendesk_blocks_to_lines(_z_blocks, limit=3)
                 zendesk_result_text = _zendesk_lines_to_text(_z_rows)
                 slack_result = _await("slack", futs2["slack"], SLACK_TIMEOUT)
                 gmail_result = _await("gmail", futs2["gmail"], 15)
 
-    # 3섹션으로 출력
-    notion_txt  = f"1. Notion：\n{faq_result if not _nohit_or_err(faq_result) else _nohit_text(faq_result)}"
-    zendesk_txt = f"2. Zendesk：\n{zendesk_result_text if not _nohit_or_err(zendesk_result_text) else _nohit_text(zendesk_result_text)}"
-    sg_parts = []
+    # ── LLMへ渡す入力を「件数付き・短文化」に変換（ここが主変更点）
+    notion_cnt = 0 if _nohit_or_err(faq_result) else 1
+    z_cnt      = len(_z_rows)
+    sg_cnt     = 1 if (_sg_hit(slack_result) or _sg_hit(gmail_result)) else 0
 
-    # Slack
-    if isinstance(slack_result, str) and slack_result in ("__ERR__", "__ERR_TIMEOUT__"):
-        sg_parts.append(f"• *Slack*\n{_nohit_text(slack_result)}")
-    elif (isinstance(slack_result, list) and len(slack_result) > 0) or \
-        (slack_result and not _nohit(slack_result)):
-        sg_parts.append(f"• *Slack*\n{slack_result}")
-    else:
-        sg_parts.append(f"• *Slack*\n{_nohit_text(slack_result)}")
+    zendesk_evi    = _zendesk_evidence(_z_rows)  # URL無しの証拠
+    notion_for_llm = _decorate_with_count("" if notion_cnt == 0 else safe_block_text(str(faq_result), 400), notion_cnt)
+    z_for_llm      = _decorate_with_count(zendesk_evi, z_cnt)
 
-    # Gmail
-    if isinstance(gmail_result, str) and gmail_result in ("__ERR__", "__ERR_TIMEOUT__"):
-        sg_parts.append(f"• *Gmail*\n{_nohit_text(gmail_result)}")
-    elif gmail_result and not _nohit(gmail_result):
-        sg_parts.append(f"• *Gmail*\n{gmail_result}")
-    else:
-        sg_parts.append(f"• *Gmail*\n{_nohit_text(gmail_result)}")
-    sg_txt = "3. Slack・Gmail：\n" + "\n".join(sg_parts)
+    sg_text = ""
+    if _sg_hit(slack_result):
+        sg_text += safe_block_text(str(slack_result), 200)
+    if _sg_hit(gmail_result):
+        sg_text += (" / " if sg_text else "") + safe_block_text(str(gmail_result), 200)
+    sg_for_llm = _decorate_with_count(sg_text, sg_cnt)
 
+    # ── 要約と回答生成（ZendeskがN>0で「該当なし」を出させない）
     summary_ja = summarize_search_outputs_ja(
-        corrected_query, faq_result, zendesk_result_text, slack_result, gmail_result
+        corrected_query, notion_for_llm, z_for_llm, sg_for_llm, ""
+    )
+    if z_cnt > 0:
+        summary_ja = re.sub(r"(2\. Zendesk：)「該当なし」", r"\1「Zendeskで関連チケットあり」", summary_ja)
+
+    answer_ja = generate_answer_ja(
+        corrected_query, notion_for_llm, z_for_llm, sg_for_llm, ""
     )
 
     summary_bold = "*⭐️要約⭐️：*\n" + "\n".join(
         f"*{line}*" if line.strip() else "" for line in summary_ja.splitlines()
     )
-    answer_ja = generate_answer_ja(
-        corrected_query, faq_result, zendesk_result_text, slack_result, gmail_result
-    )
 
-    # --- 出力の組み立て（明細は既定で非表示） ---
+    # ── 明細表示は既定でOFF
     if SHOW_SOURCE_SNIPPETS:
-        # 旧来の明細表示を残したい場合のみ生成
         notion_txt  = f"1. Notion：\n{faq_result if not _nohit_or_err(faq_result) else _nohit_text(faq_result)}"
         zendesk_txt = f"2. Zendesk：\n{zendesk_result_text if not _nohit_or_err(zendesk_result_text) else _nohit_text(zendesk_result_text)}"
 
@@ -1658,16 +1657,11 @@ def handle_mention_events(body, say):
 
         combined = f"{summary_bold}\n\n*回答：*\n{answer_ja}\n\n{notion_txt}\n\n{zendesk_txt}\n\n{sg_txt}"
     else:
-        # 明細を完全に非表示
         combined = f"{summary_bold}\n\n*回答：*\n{answer_ja}"
 
     send_faq_with_feedback(
-        say,
-        title="検索結果",
-        answer=combined,
-        faq_id="search",
-        corrected_query=corrected_query,
-        user=user_id
+        say, title="検索結果", answer=combined,
+        faq_id="search", corrected_query=corrected_query, user=user_id
     )
     return
 
