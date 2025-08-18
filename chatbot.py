@@ -6,6 +6,7 @@ from functools import lru_cache
 import traceback
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 import unicodedata
+import math
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1) .env 먼저 로드
@@ -180,6 +181,112 @@ def safe_post_to_slack(client: WebClient, **kwargs):
             print(f"[⚠️ Slack 通信失敗] {e} (再試行 {i+1}/5)")
             time.sleep(2 * (i + 1))
 
+_CJK_RE = re.compile(r"[\u3040-\u30FF\u4E00-\u9FFF]")
+
+def _analyze_text(s: str):
+    s = _normalize_query(s or "")
+    toks = _TOKEN_RE.findall(s)
+    # CJK 토큰은 문자 2/3그램으로 확장해 구분 없이도 문구 결합을 포착
+    grams = []
+    for t in toks:
+        if _CJK_RE.search(t):
+            for n in (2, 3):
+                grams += [t[i:i+n] for i in range(max(0, len(t)-n+1))]
+    # 인접 단어 빅그램(띄어쓰기 기반)
+    word_bigrams = [f"{toks[i]} {toks[i+1]}" for i in range(len(toks)-1)]
+    terms = toks + grams + word_bigrams
+    # TF
+    tf = {}
+    for w in terms:
+        tf[w] = tf.get(w, 0) + 1
+    return {
+        "text": s,
+        "tokens": toks,
+        "terms": terms,
+        "len": max(1, len(terms)),
+        "tf": tf,
+        "set": set(terms),
+    }
+
+def _query_repr(q: str):
+    qn = _normalize_query(q or "")
+    qa = _analyze_text(qn)
+    # 공백 제거/전각 변형 등 문구 변형도 같이 본다
+    ph_vars = {qn}
+    ph_vars.add(qn.replace(" ", ""))
+    ph_vars.add(qn.replace(" ", "　"))
+    fw = _to_fullwidth_ascii(qn)
+    ph_vars.add(fw)
+    ph_vars.add(fw.replace(" ", ""))
+    return {"qnorm": qn, "qanalysis": qa, "phrases": [p for p in ph_vars if p]}
+
+def _prepare_bm25(query_terms: set[str], docs: list[dict]):
+    N = max(1, len(docs))
+    # DF
+    df = {}
+    for d in docs:
+        seen = set(d["terms"])
+        for t in query_terms:
+            if t in seen:
+                df[t] = df.get(t, 0) + 1
+    # IDF (Okapi)
+    idf = {t: math.log((N - df.get(t, 0) + 0.5) / (df.get(t, 0) + 0.5) + 1.0) for t in query_terms}
+    avgdl = sum(d["len"] for d in docs) / N
+    return idf, avgdl
+
+def _bm25_score(q_terms: list[str], d: dict, idf: dict, avgdl: float, k1=1.2, b=0.75):
+    score = 0.0
+    for t in q_terms:
+        if t not in d["tf"]:
+            continue
+        tf = d["tf"][t]
+        denom = tf + k1 * (1 - b + b * d["len"] / max(1e-6, avgdl))
+        score += idf.get(t, 0.0) * (tf * (k1 + 1)) / denom
+    return score
+
+def _proximity_bonus(q_tokens: list[str], d_tokens: list[str], window=6):
+    # 쿼리 토큰들이 짧은 창(window) 안에 함께 등장하면 보너스
+    idx = {i: d_tokens[i:i+window] for i in range(len(d_tokens))}
+    hits = 0
+    for i, win in idx.items():
+        if all(any(qt == wt for wt in win) for qt in q_tokens[: min(3, len(q_tokens))]):
+            hits += 1
+    return min(1.0, hits / 3.0)  # 0~1
+
+def unified_score(query: str, text: str, title: str | None = None,
+                  idf: dict | None = None, avgdl: float | None = None):
+    """문구+근접+BM25를 합산한 보편 점수 (모든 소스 공용)"""
+    q = _query_repr(query)
+    qa = q["qanalysis"]
+    da = _analyze_text(text or "")
+    ta = _analyze_text(title or "") if title else None
+
+    # 준비: 쿼리 용어 집합(토큰+그램+빅그램)
+    q_terms = list(set(qa["terms"]))
+    if idf is None or avgdl is None:
+        # 후보 집합이 없을 때는 간이 IDF(모두 동일)로 BM25 근사
+        idf = {t: 1.0 for t in q_terms}
+        avgdl = 200.0
+
+    bm25 = _bm25_score(q_terms, da, idf, avgdl)
+    # 제목 가중(제목에서 매칭된 용어는 1.5배)
+    if ta:
+        bm25 += 0.5 * _bm25_score(q_terms, ta, idf, avgdl)
+
+    # 문구 일치 보너스(공백/전각 변형 포함)
+    phrase_bonus = 0.0
+    for ph in q["phrases"]:
+        if ph and ph in da["text"]:
+            phrase_bonus += 2.0
+        if ta and ph and ph in ta["text"]:
+            phrase_bonus += 2.0
+
+    # 근접 보너스
+    prox = _proximity_bonus(qa["tokens"], da["tokens"])
+
+    # 최종 스코어
+    return 2.0 * bm25 + 3.0 * phrase_bonus + 2.0 * prox
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 3) GSheet 헬퍼 (서비스계정 JSON env 로 단일화)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -202,7 +309,8 @@ def _parse_service_account(raw: str) -> dict:
 
 def _gspread_open():
     env_val = os.getenv("GSHEET_ID")
-    data = _parse_service_account(os.getenv("GCP_SERVICE_ACCOUNT_JSON",""))
+    raw = os.getenv("GCP_SERVICE_ACCOUNT_JSON") or os.getenv("SERVICE_ACCOUNT_JSON","")
+    data = _parse_service_account(raw)
     creds = Credentials.from_service_account_info(
         data, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     gc = gspread.authorize(creds)
@@ -372,6 +480,7 @@ def search_slack_channels(keyword, days_min=30, days_plan=(30, 90, 180, 365),
     channels = get_channel_ids_from_env()
     if not channels:
         return "⚠️ 検索対象チャンネルが未設定です（SEARCH_CHANNELS_DB）。"
+
     sentence = _normalize_query(keyword)
     terms = _split_terms(keyword)
 
@@ -424,15 +533,18 @@ def search_slack_channels(keyword, days_min=30, days_plan=(30, 90, 180, 365),
                 break
             continue
 
+        # 1차: 기존 스코어로 300개 컷
         scored.sort(key=lambda x: x[0], reverse=True)
         coarse_top = scored[:300]
 
+        # 2차: 통합 리랭킹 (BM25 + 문구 + 근접)
+        docs_ana = [_analyze_text(t[2]) for t in coarse_top]
+        q_terms = set(_query_repr(keyword)["qanalysis"]["terms"])
+        idf, avgdl = _prepare_bm25(q_terms, docs_ana)
+
         def refine(t):
             _, cid, text, ts = t
-            q = set(terms); d = set(_split_terms(text))
-            jacc = len(q & d) / max(1, len(q | d))
-            bonus = 0.2 if sentence and sentence.lower() in text.lower() else 0
-            return t[0] + int(1000 * (jacc + bonus))
+            return unified_score(keyword, text, idf=idf, avgdl=avgdl)
 
         refined = sorted(coarse_top, key=refine, reverse=True)
         best_scored = refined
@@ -451,7 +563,7 @@ def search_slack_channels(keyword, days_min=30, days_plan=(30, 90, 180, 365),
         perma = _slack_permalink(cid, ts) if ts else None
         line = f"📌 <{perma}|#{cid}>: {text[:160]}" if perma else f"📌 <#{cid}>: {text[:160]}"
         out.append(line)
-        if len(out) >= top_k: 
+        if len(out) >= top_k:
             break
     return "\n".join(out)
 
@@ -596,7 +708,8 @@ def search_gmail(keyword, refresh_token, max_results=3):
 
     found_meta = []
     used_q = None
-    # ① 목록 조회: fields 축소
+
+    # ① ID 조회
     for q in _gmail_queries(keyword, label_filter):
         slog("gmail.query", q=q)
         res = http_get(
@@ -611,7 +724,7 @@ def search_gmail(keyword, refresh_token, max_results=3):
             continue
         used_q = q
 
-        # ② 메타 병렬 조회: Subject/From/Date 만
+        # ② 메타 병렬 조회
         def _fetch_meta(mid):
             r = http_get(
                 f"{base_url}/{mid}", headers=headers,
@@ -640,17 +753,15 @@ def search_gmail(keyword, refresh_token, max_results=3):
                 if m: metas.append(m)
         if metas:
             found_meta = metas
-            break  # 첫 히트 쿼리에서 종료
+            break
 
     if not found_meta:
         return "📭 メールが見つかりませんでした。"
 
-    # ③ 로컬 랭크(메타만)
+    # ③ 상위 K건 본문 추출
     terms = _split_terms(keyword)
     found_meta.sort(key=lambda m: _gmail_score(terms, m["subject"], "", m["from"]), reverse=True)
-
-    # ④ 상위 K건만 본문(full) 재조회
-    K = min(5, max_results)  # 본문 추출 상한
+    K = min(5, max_results)
     top_ids = [m["id"] for m in found_meta[:K]]
 
     def _fetch_body(mid):
@@ -662,7 +773,8 @@ def search_gmail(keyword, refresh_token, max_results=3):
         if r.status_code != 200:
             return mid, ""
         payload = r.json()
-        return mid, extract_email_body(payload).strip().replace("\n", " ").replace("\r", "")[:500]
+        body = extract_email_body(payload).strip().replace("\n", " ").replace("\r", "")[:500]
+        return mid, body
 
     id2preview = {}
     with ThreadPoolExecutor(max_workers=5) as ex:
@@ -671,21 +783,37 @@ def search_gmail(keyword, refresh_token, max_results=3):
             mid, prev = fu.result()
             id2preview[mid] = prev
 
-    # 미리보기 반영 후 최종 재정렬
     for m in found_meta[:K]:
         m["preview"] = id2preview.get(m["id"], "")
-    found_meta.sort(key=lambda m: _gmail_score(terms, m["subject"], m["preview"], m["from"]), reverse=True)
-    filtered_meta = [m for m in found_meta if _min_overlap_ok(m["subject"], m["preview"], terms)]
+
+    # ④ 통합 리랭킹 (BM25 + 문구 + 근접)
+    docs = []
+    for m in found_meta:
+        docs.append({"m": m, "title": m["subject"], "body": f"{m['subject']} {m['preview']}"})
+
+    idf, avgdl = _prepare_bm25(set(_query_repr(keyword)["qanalysis"]["terms"]),
+                               [_analyze_text(d["body"]) for d in docs])
+
+    def g_score(d):
+        return unified_score(keyword, d["body"], title=d["title"], idf=idf, avgdl=avgdl)
+
+    docs.sort(key=g_score, reverse=True)
+
+    # 용어 최소 겹침 필터(안전장치)
+    def _min_overlap_ok(subject: str, preview: str, terms: list[str]) -> bool:
+        lc = (_normalize_query(subject) + " " + _normalize_query(preview)).lower()
+        hits = sum(t.lower() in lc for t in terms)
+        return hits >= max(1, (len(terms)+1)//2)
+
+    filtered_meta = [d["m"] for d in docs if _min_overlap_ok(d["m"]["subject"], d["m"]["preview"], terms)]
     if not filtered_meta:
         return "📭 メールが見つかりませんでした。"
 
-    # ⑤ 출력
     slog("gmail.used_query", q=used_q or "(none)")
     lines = []
     for m in filtered_meta[:max_results]:
         lines.append(f"📧 *{m['subject']}*\n送信者: {m['from']}\n")
     return "\n".join(lines)
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 7) Notion FAQ 검색
@@ -802,6 +930,7 @@ def search_notion_faq(keyword, top_k=3):
 
         payload = {"filter": {"or": or_filters}} if or_filters else {}
         slog("notion.query", db_id=db_id, props="|".join(text_props), terms="|".join(terms), filters=len(or_filters))
+
         r = http_post(f"https://api.notion.com/v1/databases/{db_id}/query",
                       headers=headers, json=payload)
         if r.status_code != 200:
@@ -810,6 +939,7 @@ def search_notion_faq(keyword, top_k=3):
         data = r.json() or {}
         results = data.get("results") or []
         all_results.extend(results)
+
         while data.get("has_more") and data.get("next_cursor"):
             r = http_post(f"https://api.notion.com/v1/databases/{db_id}/query",
                           headers=headers, json={**payload, "start_cursor": data["next_cursor"]})
@@ -821,27 +951,29 @@ def search_notion_faq(keyword, top_k=3):
     if not all_results:
         return "🙅 関連するFAQが見つかりませんでした。"
 
-    q_text = _normalize_query(keyword)
+    # --- BM25 + Phrase + Proximity 리랭킹 ---
+    docs_ana = []
+    for r in all_results:
+        props = r.get("properties", {}) or {}
+        title = _get_title(props)
+        body = _notion_collect_text(props)
+        docs_ana.append({"r": r, "title": title, "body": body, "ana": _analyze_text(f"{title} {body}")})
 
-    def _score(props):
-        txt = _notion_collect_text(props)
-        hits = sum(1 for t in terms if t in txt)
-        if hits < max(1, (len(terms)+1)//2):
-            return 0
-        exact = hits * 5
-        fuzzy = int(100 * SequenceMatcher(None, q_text, txt[:2000]).ratio()) // 10
-        return exact + fuzzy
+    q_repr = _query_repr(keyword)
+    idf, avgdl = _prepare_bm25(set(q_repr["qanalysis"]["terms"]), [d["ana"] for d in docs_ana])
 
-    ranked = sorted(((_score(r.get("properties", {}) or {}), r) for r in all_results),
-                    key=lambda x: x[0], reverse=True)
-    top = [r for s, r in ranked if s > 0][:top_k]
+    def _score_row(d):
+        return unified_score(keyword, d["body"], title=d["title"], idf=idf, avgdl=avgdl)
+
+    ranked = sorted(docs_ana, key=_score_row, reverse=True)
+    top = [d for d in ranked if _score_row(d) > 0][:top_k]
     if not top:
         return "🙅 入力内容と類似するFAQが見つかりませんでした。"
 
     out = []
-    for r in top:
-        props = r.get("properties", {}) or {}
-        title = _get_title(props)
+    for d in top:
+        props = d["r"].get("properties", {}) or {}
+        title = d["title"]
         answer = _get_answer(props)
         out.append(f"📌 *{title}*\n📝 {answer[:200]}{'...' if len(answer) > 200 else ''}")
     return "\n\n".join(out)
@@ -933,7 +1065,7 @@ def _ztext(t):
     # APIでcommentsを返さないことが多いので安全に無視
     return _normalize_query_for_zendesk(f"{subj} {desc} {tags}")
 
-def search_zendesk_ticket_text(keyword):
+def search_zendesk_ticket_text(keyword, top_k=5):
     subdomain = os.getenv("ZENDESK_SUBDOMAIN")
     email = os.getenv("ZENDESK_EMAIL")
     token = (os.getenv("ZENDESK_API_TOKEN") or "").strip()
@@ -942,12 +1074,11 @@ def search_zendesk_ticket_text(keyword):
 
     results = []
     for q in _zendesk_queries(keyword):
-        slog("zendesk.query", q=q)  # [FIX] 正しい変数名
-        try:  # [FIX]
+        slog("zendesk.query", q=q)
+        try:
             items = _zendesk_search_all(url, auth, q)
-        except Exception as e:  # [FIX]
-            import traceback
-            slog("zendesk.error", err=str(e), tb=traceback.format_exc())
+            items = [it for it in items if it.get("result_type") == "ticket"]
+        except Exception:
             items = []
         if items:
             results = items
@@ -956,21 +1087,29 @@ def search_zendesk_ticket_text(keyword):
     if not results:
         return "🙅 チケットが見つかりませんでした。"
 
-    sent = _normalize_query_for_zendesk(keyword).lower()
-    terms_lc = [w.lower() for w in _zendesk_terms(keyword)]
+    docs = []
+    for t in results:
+        subj = (t.get("subject") or "")
+        desc = (t.get("description") or "")
+        tags = " ".join(t.get("tags", []) or [])
+        docs.append({"t": t, "title": subj, "body": f"{subj} {desc} {tags}"})
 
-    def _subj(t): return _normalize_query_for_zendesk(t.get("subject","")).lower()
+    idf, avgdl = _prepare_bm25(set(_query_repr(keyword)["qanalysis"]["terms"]),
+                               [_analyze_text(d["body"]) for d in docs])
 
-    def score(t):
-        txt = _ztext(t).lower()
-        hit = sum(1 for w in terms_lc if w in txt)
-        phrase_bonus = 5 if sent and sent in txt else 0
-        fuzz = int(10 * hit / max(1, len(terms_lc)))
-        return hit * 3 + fuzz + phrase_bonus
+    def score_z(d):
+        return unified_score(keyword, d["body"], title=d["title"], idf=idf, avgdl=avgdl)
 
-    ranked = sorted(results, key=score, reverse=True)
-    return "\n".join(f"#{t.get('id','')} {t.get('subject','(件名不明)')} [status:{t.get('status','?')}]"
-                     for t in ranked[:3])
+    ranked = sorted(docs, key=score_z, reverse=True)
+    lines = []
+    for d in ranked[:top_k]:
+        t = d["t"]
+        tid = t.get("id","")
+        subject = t.get("subject","(件名不明)")
+        status = t.get("status","?")
+        url_t = f"https://{subdomain}.zendesk.com/agent/tickets/{tid}"
+        lines.append(f"#{tid} {subject} [status:{status}] {url_t}")
+    return "\n".join(lines)
 
 def search_zendesk_ticket_blocks(keyword, top_k=3):
     subdomain = os.getenv("ZENDESK_SUBDOMAIN")
@@ -981,8 +1120,12 @@ def search_zendesk_ticket_blocks(keyword, top_k=3):
 
     results = []
     for q in _zendesk_queries(keyword):
-        items = _zendesk_search_all(url, auth, q)
-        items = [it for it in items if it.get("result_type") == "ticket"]
+        slog("zendesk.query", q=q)
+        try:
+            items = _zendesk_search_all(url, auth, q)
+            items = [it for it in items if it.get("result_type") == "ticket"]
+        except Exception:
+            items = []
         if items:
             results = items
             break
@@ -990,18 +1133,25 @@ def search_zendesk_ticket_blocks(keyword, top_k=3):
     if not results:
         return [{"type":"section","text":{"type":"mrkdwn","text":"🙅 チケットが見つかりませんでした。"}}]
 
-    terms_lc = [w.lower() for w in _zendesk_terms(keyword)]
-    def score(t):
-        txt = _ztext(t).lower()
-        exact = sum(1 for w in terms_lc if w in txt) * 3
-        overlap = len([w for w in terms_lc if w in txt])
-        fuzz = int(10 * overlap / max(1, len(terms_lc)))
-        return exact + fuzz
+    # --- 통합 리랭킹 ---
+    docs = []
+    for t in results:
+        subj = (t.get("subject") or "")
+        desc = (t.get("description") or "")
+        tags = " ".join(t.get("tags", []) or [])
+        docs.append({"t": t, "title": subj, "body": f"{subj} {desc} {tags}"})
 
-    ranked = sorted(results, key=score, reverse=True)
+    idf, avgdl = _prepare_bm25(set(_query_repr(keyword)["qanalysis"]["terms"]),
+                               [_analyze_text(d["body"]) for d in docs])
+
+    def score_z(d):
+        return unified_score(keyword, d["body"], title=d["title"], idf=idf, avgdl=avgdl)
+
+    ranked = sorted(docs, key=score_z, reverse=True)
 
     blocks = [{"type":"section","text":{"type":"mrkdwn","text":"*🎫 Zendesk チケット検索結果:*"}}]
-    for t in ranked[:top_k]:
+    for d in ranked[:top_k]:
+        t = d["t"]
         tid = t.get("id","")
         subject = t.get("subject","(件名不明)")
         status = t.get("status","(ステータス不明)")
