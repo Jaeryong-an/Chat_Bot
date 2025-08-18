@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 from functools import lru_cache
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1) .env 먼저 로드
@@ -1161,6 +1161,32 @@ def handle_additional_comment(body, say, client):
 # ──────────────────────────────────────────────────────────────────────────────
 # 13) 멘션 이벤트
 # ──────────────────────────────────────────────────────────────────────────────
+SLACK_TIMEOUT = 30  # Slack은 15초→30초 권장
+
+def _await(name, fut, timeout):
+    """各検索Futureの完了/失敗/タイムアウトを判別してログする"""
+    try:
+        res = fut.result(timeout=timeout)
+        print(f"[{name.upper()}] done type={type(res).__name__}", flush=True)
+        return res
+    except TimeoutError:
+        print(f"[{name.upper()}] TIMEOUT after {timeout}s", flush=True)
+        return "__ERR_TIMEOUT__"
+    except Exception as e:
+        print(f"[{name.upper()}] ERROR: {e}\n{traceback.format_exc()}", flush=True)
+        return "__ERR__"
+
+def _nohit_or_err(x):
+    if isinstance(x, str) and x in ("__ERR__", "__ERR_TIMEOUT__"):
+        return True
+    return _nohit(x)
+
+def _nohit_text(x):
+    """結果の見せ方を統一（失敗と無該当の区別）"""
+    if x in ("__ERR__", "__ERR_TIMEOUT__"):  # 取得失敗
+        return "⚠️ 取得に失敗しました。"
+    return "🙅 該当なし"
+
 @slack_app.event("app_mention")
 def handle_mention_events(body, say):
     text = body.get("event", {}).get("text", "")
@@ -1174,7 +1200,6 @@ def handle_mention_events(body, say):
     print(f"[SEARCH] dispatch sources=notion,zendesk,slack q='{search_q}'", flush=True)
     say(text="🔎 検索中です。少々お待ちください...")
 
-    # 1차: 병렬 검색
     with ThreadPoolExecutor(max_workers=6) as ex:
         futs = {
             "faq":   ex.submit(search_notion_faq, search_q),
@@ -1182,19 +1207,16 @@ def handle_mention_events(body, say):
             "slack": ex.submit(search_slack_channels, search_q),
             "gmail": ex.submit(_search_gmail_first_account, search_q),
         }
-        try:    faq_result = futs["faq"].result(timeout=15)
-        except: faq_result = ""
-        try:    _z_blocks = futs["zblk"].result(timeout=15)
-        except: _z_blocks = []
+        faq_result   = _await("faq",   futs["faq"],   15)
+        _z_blocks    = _await("zblk",  futs["zblk"],  15) or []
         _z_rows = _zendesk_blocks_to_lines(_z_blocks)
         zendesk_result_text = _zendesk_lines_to_text(_z_rows)
-        try:    slack_result = futs["slack"].result(timeout=15) or "🙅 Slack内で関連するメッセージが見つかりませんでした。"
-        except: slack_result = "🙅 Slack内で関連するメッセージが見つかりませんでした。"
-        try:    gmail_result = futs["gmail"].result(timeout=15) or "📭 メールが見つかりませんでした。"
-        except: gmail_result = "📭 メールが見つかりませんでした。"
+        slack_result = _await("slack", futs["slack"], SLACK_TIMEOUT)
+        gmail_result = _await("gmail", futs["gmail"], 15)
+
 
     # 무히트면 2차: 키워드 압축 후 병렬 재검색
-    if all(_nohit(x) for x in [faq_result, zendesk_result_text, slack_result, gmail_result]):
+    if all(_nohit_or_err(x) for x in [faq_result, zendesk_result_text, slack_result, gmail_result]):
         ai_kws = extract_keywords_ai(corrected_query)
         if ai_kws:
             search_q2 = build_search_text(ai_kws)
@@ -1206,26 +1228,35 @@ def handle_mention_events(body, say):
                     "slack": ex.submit(search_slack_channels, search_q2),
                     "gmail": ex.submit(_search_gmail_first_account, search_q2),
                 }
-                try:    faq_result = futs2["faq"].result(timeout=15)
-                except: faq_result = ""
-                try:    _z_blocks = futs2["zblk"].result(timeout=15)
-                except: _z_blocks = []
+                faq_result   = _await("faq",   futs2["faq"],   15)
+                _z_blocks    = _await("zblk",  futs2["zblk"],  15) or []
                 _z_rows = _zendesk_blocks_to_lines(_z_blocks)
                 zendesk_result_text = _zendesk_lines_to_text(_z_rows)
-                try:    slack_result = futs2["slack"].result(timeout=15) or "🙅 Slack内で関連するメッセージが見つかりませんでした。"
-                except: slack_result = "🙅 Slack内で関連するメッセージが見つかりませんでした。"
-                try:    gmail_result = futs2["gmail"].result(timeout=15) or "📭 メールが見つかりませんでした。"
-                except: gmail_result = "📭 メールが見つかりませんでした。"
+                slack_result = _await("slack", futs2["slack"], SLACK_TIMEOUT)
+                gmail_result = _await("gmail", futs2["gmail"], 15)
 
     # 3섹션으로 출력
-    notion_txt  = f"1. Notion：\n{faq_result if faq_result and not _nohit(faq_result) else '🙅 該当なし'}"
-    zendesk_txt = f"2. Zendesk：\n{zendesk_result_text if zendesk_result_text and not _nohit(zendesk_result_text) else '🙅 該当なし'}"
+    notion_txt  = f"1. Notion：\n{faq_result if not _nohit_or_err(faq_result) else _nohit_text(faq_result)}"
+    zendesk_txt = f"2. Zendesk：\n{zendesk_result_text if not _nohit_or_err(zendesk_result_text) else _nohit_text(zendesk_result_text)}"
     sg_parts = []
-    if slack_result and not _nohit(slack_result):
+
+    # Slack
+    if isinstance(slack_result, str) and slack_result in ("__ERR__", "__ERR_TIMEOUT__"):
+        sg_parts.append(f"• *Slack*\n{_nohit_text(slack_result)}")
+    elif (isinstance(slack_result, list) and len(slack_result) > 0) or \
+        (slack_result and not _nohit(slack_result)):
         sg_parts.append(f"• *Slack*\n{slack_result}")
-    if gmail_result and not _nohit(gmail_result):
+    else:
+        sg_parts.append(f"• *Slack*\n{_nohit_text(slack_result)}")
+
+    # Gmail
+    if isinstance(gmail_result, str) and gmail_result in ("__ERR__", "__ERR_TIMEOUT__"):
+        sg_parts.append(f"• *Gmail*\n{_nohit_text(gmail_result)}")
+    elif gmail_result and not _nohit(gmail_result):
         sg_parts.append(f"• *Gmail*\n{gmail_result}")
-    sg_txt = "3. Slack・Gmail：\n" + ("\n".join(sg_parts) if sg_parts else "🙅 該当なし")
+    else:
+        sg_parts.append(f"• *Gmail*\n{_nohit_text(gmail_result)}")
+    sg_txt = "3. Slack・Gmail：\n" + "\n".join(sg_parts)
 
     combined = f"{notion_txt}\n\n{zendesk_txt}\n\n{sg_txt}"
 
