@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 from functools import lru_cache
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1) .env 먼저 로드
@@ -1165,92 +1166,78 @@ def handle_mention_events(body, say):
     text = body.get("event", {}).get("text", "")
     bot_user_id = body["authorizations"][0]["user_id"]
     user_id = body["event"]["user"]
-    clean_text = text.replace(f"<@{bot_user_id}>", "").strip()
-    user_query = clean_text
+    user_query = text.replace(f"<@{bot_user_id}>", "").strip()
 
     corrected_query = correct_typo_with_gpt(user_query)
     search_q = build_search_text(corrected_query)
     print(f"[ユーザー入力] {user_query} → [修正後] {corrected_query}")
-    print(f"[SEARCH] dispatch sources=notion,zendesk,slack q='{corrected_query}'", flush=True)
+    print(f"[SEARCH] dispatch sources=notion,zendesk,slack q='{search_q}'", flush=True)
     say(text="🔎 検索中です。少々お待ちください...")
 
-    faq_result  = search_notion_faq(search_q)
-    _z_blocks   = search_zendesk_ticket_blocks(search_q)
-    _z_rows     = _zendesk_blocks_to_lines(_z_blocks)
-    zendesk_result_text = _zendesk_lines_to_text(_z_rows)
-    slack_result = search_slack_channels(search_q) or "🙅 Slack内で関連するメッセージが見つかりませんでした。"
-    gmail_result = _search_gmail_first_account(search_q) or "📭 メールが見つかりませんでした。"
+    # 1차: 병렬 검색
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futs = {
+            "faq":   ex.submit(search_notion_faq, search_q),
+            "zblk":  ex.submit(search_zendesk_ticket_blocks, search_q),
+            "slack": ex.submit(search_slack_channels, search_q),
+            "gmail": ex.submit(_search_gmail_first_account, search_q),
+        }
+        try:    faq_result = futs["faq"].result(timeout=15)
+        except: faq_result = ""
+        try:    _z_blocks = futs["zblk"].result(timeout=15)
+        except: _z_blocks = []
+        _z_rows = _zendesk_blocks_to_lines(_z_blocks)
+        zendesk_result_text = _zendesk_lines_to_text(_z_rows)
+        try:    slack_result = futs["slack"].result(timeout=15) or "🙅 Slack内で関連するメッセージが見つかりませんでした。"
+        except: slack_result = "🙅 Slack内で関連するメッセージが見つかりませんでした。"
+        try:    gmail_result = futs["gmail"].result(timeout=15) or "📭 メールが見つかりませんでした。"
+        except: gmail_result = "📭 メールが見つかりませんでした。"
 
-    print("[SRC] FAQ len:", len(faq_result or ""))
-    print("[SRC] ZD  hits:", 0 if (zendesk_result_text or "").startswith("🙅") else len((zendesk_result_text or "").splitlines()))
-    print("[SRC] SLK hit?:", not (slack_result or "").startswith("🙅"))
-    print("[SRC] GML hit?:", not (gmail_result or "").startswith(("📭","❌")))
-
+    # 무히트면 2차: 키워드 압축 후 병렬 재검색
     if all(_nohit(x) for x in [faq_result, zendesk_result_text, slack_result, gmail_result]):
         ai_kws = extract_keywords_ai(corrected_query)
         if ai_kws:
             search_q2 = build_search_text(ai_kws)
             print(f"[SEARCH] retry q='{search_q2}'", flush=True)
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                futs2 = {
+                    "faq":   ex.submit(search_notion_faq, search_q2),
+                    "zblk":  ex.submit(search_zendesk_ticket_blocks, search_q2),
+                    "slack": ex.submit(search_slack_channels, search_q2),
+                    "gmail": ex.submit(_search_gmail_first_account, search_q2),
+                }
+                try:    faq_result = futs2["faq"].result(timeout=15)
+                except: faq_result = ""
+                try:    _z_blocks = futs2["zblk"].result(timeout=15)
+                except: _z_blocks = []
+                _z_rows = _zendesk_blocks_to_lines(_z_blocks)
+                zendesk_result_text = _zendesk_lines_to_text(_z_rows)
+                try:    slack_result = futs2["slack"].result(timeout=15) or "🙅 Slack内で関連するメッセージが見つかりませんでした。"
+                except: slack_result = "🙅 Slack内で関連するメッセージが見つかりませんでした。"
+                try:    gmail_result = futs2["gmail"].result(timeout=15) or "📭 メールが見つかりませんでした。"
+                except: gmail_result = "📭 メールが見つかりませんでした。"
 
-            faq_result  = search_notion_faq(search_q2)
-            _z_blocks   = search_zendesk_ticket_blocks(search_q2)
-            _z_rows     = _zendesk_blocks_to_lines(_z_blocks)
-            zendesk_result_text = _zendesk_lines_to_text(_z_rows)
-            slack_result = search_slack_channels(search_q2) or "🙅 Slack内で関連するメッセージが見つかりませんでした。"
-            gmail_result = _search_gmail_first_account(search_q2) or "📭 メールが見つかりませんでした。"
+    # 3섹션으로 출력
+    notion_txt  = f"1. Notion：\n{faq_result if faq_result and not _nohit(faq_result) else '🙅 該当なし'}"
+    zendesk_txt = f"2. Zendesk：\n{zendesk_result_text if zendesk_result_text and not _nohit(zendesk_result_text) else '🙅 該当なし'}"
+    sg_parts = []
+    if slack_result and not _nohit(slack_result):
+        sg_parts.append(f"• *Slack*\n{slack_result}")
+    if gmail_result and not _nohit(gmail_result):
+        sg_parts.append(f"• *Gmail*\n{gmail_result}")
+    sg_txt = "3. Slack・Gmail：\n" + ("\n".join(sg_parts) if sg_parts else "🙅 該当なし")
 
-    if all(_nohit(x) for x in [faq_result, zendesk_result_text, slack_result, gmail_result]):
-        return send_faq_with_feedback(
-            say, "AI回答",
-            f"該当する情報が見つかりませんでした。\n質問: {corrected_query}\n補足を教えてください。",
-            "ai", corrected_query, user=user_id
-        )
-    has_hit = not all(_nohit(x) for x in [faq_result, zendesk_result_text, slack_result, gmail_result])
+    combined = f"{notion_txt}\n\n{zendesk_txt}\n\n{sg_txt}"
 
-    prompt = (
-        f"ユーザーからの質問: {corrected_query}\n\n"
-        f"以下の資料『のみ』を根拠に、上位3つの異なる解決案を作成せよ。\n"
-        f"■ FAQ:\n{faq_result}\n\n"
-        f"■ Zendesk(上位):\n{zendesk_result_text}\n\n"
-        f"■ Slack:\n{slack_result}\n\n"
-        f"■ Gmail:\n{gmail_result}\n\n"
-        "出力要件:\n"
-        "- 3案ちょうど出す。各案は2文以内。重複は避ける。\n"
-        "- それぞれ『見出し: 一行』『要点: 一行』の順で簡潔に。\n"
-        "- 各案の間は区切り線だけの行『---』で区切る。前置きや余計な文は禁止。\n"
+    send_faq_with_feedback(
+        say,
+        title="検索結果",
+        answer=combined,
+        faq_id="search",
+        corrected_query=corrected_query,
+        user=user_id
     )
-    try:
-        r = OAI.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system","content": (
-                    "あなたはSlack上で動作するアシスタントボットです。\n"
-                    "ユーザーの質問に対して、以下の複数の情報源（FAQ、Zendesk、Slack過去投稿）を参照し、"
-                    "最も信頼性が高く、関連性のある回答を日本語で作成してください。\n"
-                    "回答は2〜3文程度の丁寧で簡潔な表現とし、"
-                    "専門用語が含まれる場合はわかりやすく説明してください。\n"
-                    "不明確な情報しかない場合でも、誠実にその旨を伝えるようにしてください。"
-                )},
-                {"role": "user","content": prompt}
-            ],
-            temperature=0.2
-        )
-        raw = (r.choices[0].message.content or "").strip()
-        parts = [p.strip() for p in raw.split("---") if p.strip()]
-        top3 = parts[:3] if len(parts) >= 3 else [raw]
-    except Exception as e:
-        top3 = [f"❌ OpenAI API 呼び出し失敗: {str(e)}"]
-
-    # 3件を個別に送信（各案に独立フィードバック）
-    for i, ans in enumerate(top3, start=1):
-        send_faq_with_feedback(
-            say,
-            title=f"AI回答 候補{i}",
-            answer=ans,
-            faq_id=f"ai-{i}",
-            corrected_query=corrected_query,
-            user=user_id
-        )
+    return
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 14) Gmail 신규/범위 수집
