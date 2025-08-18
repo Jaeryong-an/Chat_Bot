@@ -1,9 +1,10 @@
+from __future__ import annotations
 import os, json, time, threading, base64, re
 from datetime import datetime, timedelta
 from typing import Optional, Any, List
 from functools import lru_cache
 import traceback
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 import unicodedata
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -168,12 +169,12 @@ def safe_post_to_slack(client: WebClient, **kwargs):
         try:
             return client.chat_postMessage(**kwargs)
         except SlackApiError as e:
-            # 429 존중
             if e.response.status_code == 429:
                 wait = int(e.response.headers.get("Retry-After", "2"))
                 time.sleep(wait)
             else:
-                print(f"[❌ Slack エラー] {e.response.get('error')} (再試行 {i+1}/5)")
+                err = (e.response or {}).get("error")
+                print(f"[❌ Slack エラー] {err} (再試行 {i+1}/5)")
                 time.sleep(2 * (i + 1))
         except Exception as e:
             print(f"[⚠️ Slack 通信失敗] {e} (再試行 {i+1}/5)")
@@ -340,7 +341,7 @@ def _slack_score(terms, sentence, text):
     fuzz = int(10 * overlap / max(1, len(terms)))
     return phrase + exact + fuzz
 
-def _slack_fetch_messages(client, channel_id, max_pages=2, page_size=200, oldest=None, max_total=300):
+def _slack_fetch_messages(client, channel_id, max_pages=1, page_size=150, oldest=None, max_total=200):
     msgs, cursor = [], None
     for _ in range(max_pages):
         resp = client.conversations_history(
@@ -368,50 +369,70 @@ def search_slack_channels(keyword, days_min=30, days_plan=(30, 90, 180, 365),
                           target_hits=200, per_channel_cap=300, global_cap=1000):
     client = get_slack()
     channels = get_channel_ids_from_env()
+    if not channels:
+        return "⚠️ 検索対象チャンネルが未設定です（SEARCH_CHANNELS_DB）。"
     sentence = _normalize_query(keyword)
     terms = _split_terms(keyword)
+
+    # 시간 예산(초)
+    budget_sec = float(os.getenv("SLACK_BUDGET_SEC", "20"))
+    deadline = time.monotonic() + budget_sec
 
     # 기간 해제 트리거
     unlimited = any(w in keyword.lower() for w in ("alltime", "全期間", "全て", "전체"))
     windows = [None] if unlimited else list(days_plan)
 
+    def ts_oldest(days):
+        return None if days is None else f"{time.time() - days*86400:.6f}"  # ← 변경: str ts
+
     best_scored = []
     for days in windows:
-        oldest = None if days is None else int(time.time()) - days * 86400
+        oldest = ts_oldest(days)
         slog("slack.query", channels=",".join(channels), sentence=sentence,
              terms="|".join(terms), window_days=("unlimited" if oldest is None else days))
 
-        scored = []
-        for cid in channels:
+        # 채널 병렬 수집(페이지/사이즈 보수화)
+        def fetch_one(cid):
             try:
-                msgs = _slack_fetch_messages(client, cid, max_pages=2, page_size=200,
+                msgs = _slack_fetch_messages(client, cid,
+                                             max_pages=1, page_size=150,  # ← 축소
                                              oldest=oldest, max_total=per_channel_cap)
+                out = []
                 for msg in msgs:
                     text = (msg.get("text") or "").strip()
                     if not text:
                         continue
-                    # 1차 프리필터: 빠른 컷
                     overlap = sum(1 for t in terms if t.lower() in text.lower())
                     if sentence and sentence.lower() in text.lower():
-                        s = 999 + overlap  # 강한 부스트
+                        s = 999 + overlap
                     elif overlap < max(1, (len(terms)+1)//2):
                         continue
                     else:
                         s = _slack_score(terms, sentence, text)
-                    scored.append((s, cid, text, msg.get("ts")))
-                    if len(scored) >= global_cap:
-                        break
+                    out.append((s, cid, text, msg.get("ts")))
+                return out
             except Exception as e:
                 print(f"❌ Slack検索エラー ({cid}): {e}")
-            if len(scored) >= global_cap:
-                break
+                return []
 
-        # 2패스 랭킹: 상위 K에만 정밀 재랭크
+        scored = []
+        with ThreadPoolExecutor(max_workers=min(6, max(1, len(channels)))) as ex:
+            futs = [ex.submit(fetch_one, cid) for cid in channels]
+            for fu in as_completed(futs):
+                scored.extend(fu.result())
+                if time.monotonic() > deadline or len(scored) >= global_cap:
+                    break
+
+        if not scored:
+            if time.monotonic() > deadline:
+                break
+            continue
+
+        # 2패스 랭킹
         scored.sort(key=lambda x: x[0], reverse=True)
-        coarse_top = scored[:400]
+        coarse_top = scored[:300]
         def refine(t):
             _, cid, text, ts = t
-            # 토큰 Jaccard + 문장 포함 보너스
             q = set(terms); d = set(_split_terms(text))
             jacc = len(q & d) / max(1, len(q | d))
             bonus = 0.2 if sentence and sentence.lower() in text.lower() else 0
@@ -419,15 +440,14 @@ def search_slack_channels(keyword, days_min=30, days_plan=(30, 90, 180, 365),
         refined = sorted(coarse_top, key=refine, reverse=True)
 
         best_scored = refined
-        if len(refined) >= target_hits or unlimited:
-            break  # 충분히 모였으면 확장 중단
+        if len(refined) >= target_hits or unlimited or time.monotonic() > deadline:
+            break
 
     if not best_scored:
         return "🙅 Slack内で関連するメッセージが見つかりませんでした。"
 
     # 스레드 확장: 상위 5개는 permalink로 노출
-    out = []
-    seen = set()
+    out, seen = [], set()
     for s, cid, text, ts in best_scored:
         key = text[:200].strip()
         if key in seen:
@@ -447,15 +467,22 @@ def search_slack_channels(keyword, days_min=30, days_plan=(30, 90, 180, 365),
 # 6) Gmail 토큰/검색
 # ──────────────────────────────────────────────────────────────────────────────
 # ───── Gmail search helpers (sentence + keywords + fallback) ─────
+# Gmail: precision→recall 폴백
 def _gmail_queries(keyword: str, label_filter: str):
     sent  = _normalize_query(keyword)
     terms = _split_terms(keyword)
-    filt  = ' -in:spam -in:trash' + (f' label:{label_filter}' if label_filter else "")
+    filt  = ' -in:spam -in:trash' + (f' label:"{label_filter}"' if label_filter else "")
     qs = []
+    # 1) 문구 전체 일치
+    if sent:
+        qs.append(f'"{sent}"{filt}')
+        qs.append(f'subject:"{sent}"{filt}')
+    # 2) 토큰 AND
     if terms:
-        qs.append(f'{" ".join(terms)}{filt}')                       # AND 기본
-        qs.append(f'{" ".join("subject:"+t for t in terms)}{filt}') # 제목 집중
-    else:
+        qs.append(f'{" ".join(terms)}{filt}')
+        qs.append(f'{" ".join("subject:"+t for t in terms)}{filt}')
+    # 3) 비상시 필터만
+    if not qs:
         qs.append(filt.strip())
     return qs
 
@@ -613,7 +640,6 @@ def search_gmail(keyword, refresh_token, max_results=3):
                 elif n == "Date":  date_str= h.get("value", "(不明)")
             return {"id": payload.get("id"), "subject": subject, "from": sender, "date": date_str, "preview": ""}
 
-        from concurrent.futures import ThreadPoolExecutor, as_completed
         metas = []
         with ThreadPoolExecutor(max_workers=8) as ex:
             futs = {ex.submit(_fetch_meta, mid): mid for mid in ids[: max_results * 4]}
@@ -639,7 +665,7 @@ def search_gmail(keyword, refresh_token, max_results=3):
         r = http_get(
             f"{base_url}/{mid}", headers=headers,
             params={"format": "full", "fields": "id,payload/parts,payload/body"},
-            timeout=20,
+            timeout=(5, 20),
         )
         if r.status_code != 200:
             return mid, ""
@@ -777,7 +803,7 @@ def search_notion_faq(keyword):
         # ← ここから: or_filters は一度だけ構築
         props_meta = _notion_props(db_id)
         or_filters = []
-        for t in terms[:8]:
+        for t in terms[:6]:
             for p in text_props:
                 cond = "title" if (props_meta.get(p, {}).get("type") == "title") else "rich_text"
                 or_filters.append({"property": p, cond: {"contains": t}})
@@ -785,15 +811,27 @@ def search_notion_faq(keyword):
         payload = {"filter": {"or": or_filters}} if or_filters else {}
         slog("notion.query", db_id=db_id, props="|".join(text_props), terms="|".join(terms), filters=len(or_filters))
 
-        r = http_post(f"https://api.notion.com/v1/databases/{db_id}/query", headers=headers, json=payload)
+        r = http_post(f"https://api.notion.com/v1/databases/{db_id}/query",
+                    headers=headers, json=payload)
         print(f"[NOTION] status={r.status_code} bytes={len(r.text)}")
 
         if r.status_code == 200:
             data = r.json() or {}
             results = data.get("results") or []
             print(f"[NOTION] hits={len(results)}")
-            # ← ここがバグ修正の本体: 取得結果を収集
             all_results.extend(results)
+
+            while data.get("has_more") and data.get("next_cursor"):
+                r = http_post(
+                    f"https://api.notion.com/v1/databases/{db_id}/query",
+                    headers=headers,
+                    json={**payload, "start_cursor": data["next_cursor"]},
+                )
+                if r.status_code != 200:
+                    break
+                data = r.json() or {}
+                results = data.get("results") or []
+                all_results.extend(results)
         else:
             print(f"[NOTION] error-body={r.text[:200]}")
 
@@ -858,31 +896,36 @@ def _zendesk_terms(keyword: str):
     return terms
 
 # 全角/半角・大文字小文字・ワイルドカードを含めて検索語を拡張
+# Zendesk: 문구 우선 + 기존 와일드카드 폴백
 def _zendesk_queries(keyword: str):
-    terms = [t for t in _zendesk_terms(keyword) if t.strip()][:6]
-    if not terms:
+    sent   = _normalize_query_for_zendesk(keyword)
+    terms  = [t for t in _zendesk_terms(keyword) if t.strip()]
+    if not terms and not sent:
         return []
 
-    # ① 가장 엄격: AND (type:ticket + 공백 AND)
-    q_and = "type:ticket " + " ".join(terms)
+    def star(t: str) -> str:
+        return t if t.endswith("*") or len(t) < 3 else t + "*"
 
-    # ② 중간: 필드別 OR (subject/description/tags)
-    field_terms = []
-    for t in terms:
-        field_terms.append(f"subject:{t}")
-        field_terms.append(f"description:{t}")
-        field_terms.append(f"tags:{t}")
-    q_fields_or = "type:ticket (" + " OR ".join(field_terms) + ")"
+    starred = [star(t) for t in terms][:8]
+    plain   = terms[:8]
 
-    # ③ 완화: type:ticket + 자유어
-    q_broad = "type:ticket (" + " ".join(terms) + ")"
-
-    # ④ 최후: 자유어
-    q_fallback = " ".join(terms)
-
-    return [q_and, q_fields_or, q_broad, q_fallback]
-
-import requests
+    qs = []
+    # 1) 문구(제목/본문) 정확 일치
+    if sent:
+        qs.append(f'type:ticket (subject:"{sent}" OR description:"{sent}")')
+    # 2) 토큰 AND (정확도↑)
+    if plain:
+        qs.append("type:ticket " + " ".join(plain))
+    # 3) 필드 OR (부분일치 포함)
+    if starred:
+        field_terms = []
+        for t in starred:
+            field_terms += [f"subject:{t}", f"description:{t}", f"tags:{t}"]
+        qs.append("type:ticket (" + " OR ".join(field_terms) + ")")
+        # 4) 완화: 자유어(부분일치)
+        qs.append("type:ticket (" + " ".join(starred) + ")")
+        qs.append(" ".join(starred))
+    return qs
 
 def _zendesk_search_all(url, auth, query, max_pages=3):
     items, page = [], 0
@@ -933,6 +976,8 @@ def search_zendesk_ticket_text(keyword):
 
     sent = _normalize_query_for_zendesk(keyword).lower()
     terms_lc = [w.lower() for w in _zendesk_terms(keyword)]
+
+    def _subj(t): return _normalize_query_for_zendesk(t.get("subject","")).lower()
 
     def score(t):
         txt = _ztext(t).lower()
@@ -1237,7 +1282,7 @@ def handle_additional_comment(body, say, client):
 # ──────────────────────────────────────────────────────────────────────────────
 # 13) 멘션 이벤트
 # ──────────────────────────────────────────────────────────────────────────────
-SLACK_TIMEOUT = 30  # Slack은 15초→30초 권장
+SLACK_TIMEOUT = int(os.getenv("SLACK_TIMEOUT", "60"))  # 30→60
 
 def _await(name, fut, timeout):
     """各検索Futureの完了/失敗/タイムアウトを判別してログする"""
