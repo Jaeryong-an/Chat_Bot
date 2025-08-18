@@ -1377,7 +1377,7 @@ def reminder_or_autosave(session_key, user_id, faq_id, question, client):
             print(f"❌ Google Sheets 保存失敗: {e}")
         try:
             client.chat_postMessage(
-                channel=_channel_id("SLACK_CHANNEL_FEEDBACK"),
+                channel="feedback-momentum",
                 text=(f"📝 フィードバック（自動保存）\n"
                       f"*質問:* {question}\n"
                       f"*ユーザー:* <@{user_id}>\n"
@@ -1412,7 +1412,8 @@ def handle_additional_comment(body, say, client):
 
         save_feedback_to_gsheet(faq_id, question, user, "no", comment=text)
         client.chat_postMessage(
-            channel=_channel_id("SLACK_CHANNEL_FEEDBACK"),
+            channel="feedback_momentum",
+            
             text=(f"📝 フィードバックコメント受信\n"
                   f"*質問:* {question}\n"
                   f"*ユーザー:* <@{user}>\n"
