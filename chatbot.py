@@ -1461,7 +1461,10 @@ def handle_mention_events(body, say):
         sg_parts.append(f"• *Gmail*\n{_nohit_text(gmail_result)}")
     sg_txt = "3. Slack・Gmail：\n" + "\n".join(sg_parts)
 
-    combined = f"0. 要約：\n{summary_ja}\n\n{notion_txt}\n\n{zendesk_txt}\n\n{sg_txt}"
+    summary_bold = "*!要約!：*\n" + "\n".join(
+        f"*{line}*" if line.strip() else "" for line in summary_ja.splitlines()
+    )
+    combined = f"{summary_bold}\n\n{notion_txt}\n\n{zendesk_txt}\n\n{sg_txt}"
 
     send_faq_with_feedback(
         say,
