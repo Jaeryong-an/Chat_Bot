@@ -817,8 +817,6 @@ def search_notion_faq(keyword, top_k=3):
                 break
             data = r.json() or {}
             all_results.extend(data.get("results") or [])
-        else:
-            print(f"[NOTION] error-body={r.text[:200]}")
 
     if not all_results:
         return "🙅 関連するFAQが見つかりませんでした。"
@@ -972,7 +970,7 @@ def search_zendesk_ticket_text(keyword):
 
     ranked = sorted(results, key=score, reverse=True)
     return "\n".join(f"#{t.get('id','')} {t.get('subject','(件名不明)')} [status:{t.get('status','?')}]"
-                     for t in ranked[:5])
+                     for t in ranked[:3])
 
 def search_zendesk_ticket_blocks(keyword, top_k=3):
     subdomain = os.getenv("ZENDESK_SUBDOMAIN")
