@@ -144,6 +144,11 @@ def _normalize_query(q: str) -> str:
 _TOKEN_RE = re.compile(
     r"[A-Za-z0-9._-]+|[\u3040-\u309F]+|[\u30A0-\u30FF\u30FC]+|[\u4E00-\u9FFF]+"
 )
+_STOP_JA = {"こと","もの","それ","これ","ため","よう","ので","など","です","ます","する","いる","ある","した","して","また","そして","ただ"}
+
+def _is_stopword(t: str) -> bool:
+    lt = t.lower()
+    return (lt in _STOP_JA)
 
 def _split_terms(text: str):
     if not text:
@@ -152,9 +157,20 @@ def _split_terms(text: str):
     terms = _TOKEN_RE.findall(text)
     seen, out = set(), []
     for t in terms:
+        if _is_stopword(t):
+            continue
+        if len(t) == 1 and not t.isdigit():
+            continue
         if t not in seen:
-            seen.add(t); out.append(t)
+            seen.add(t)
+            out.append(t)
     return out
+
+def build_search_text(q: str) -> str:
+    phrase = _normalize_query(q)
+    terms = _split_terms(q)
+    terms = terms[:8]
+    return (f"\"{phrase}\" " if phrase else "") + " ".join(terms)
 
 def safe_post_to_slack(client: WebClient, **kwargs):
     for i in range(5):
@@ -1069,6 +1085,23 @@ def correct_typo_with_gpt(input_text: str) -> str:
         print(f"[❌ 誤字修正失敗] {e}")
         return input_text
 
+def extract_keywords_ai(q: str) -> str:
+    try:
+        r = OAI.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role":"system","content":
+                 "与えられた文から検索用のキーワードを3〜8個抽出して、日本語/英語のままカンマ区切りで返す。説明不要。"},
+                {"role":"user","content": q}
+            ],
+            temperature=0
+        )
+        raw = (r.choices[0].message.content or "").strip()
+        kws = [k.strip() for k in raw.split(",") if k.strip()]
+        return " ".join(kws[:8])
+    except Exception:
+        return ""
+
 def reminder_or_autosave(session_key, user_id, faq_id, question, client):
     time.sleep(600)
     with SESS_LOCK:
@@ -1136,21 +1169,35 @@ def handle_mention_events(body, say):
     user_query = clean_text
 
     corrected_query = correct_typo_with_gpt(user_query)
+    search_q = build_search_text(corrected_query)
     print(f"[ユーザー入力] {user_query} → [修正後] {corrected_query}")
     print(f"[SEARCH] dispatch sources=notion,zendesk,slack q='{corrected_query}'", flush=True)
     say(text="🔎 検索中です。少々お待ちください...")
 
-    faq_result            = search_notion_faq(corrected_query)
-    _z_blocks = search_zendesk_ticket_blocks(corrected_query)
-    _z_rows   = _zendesk_blocks_to_lines(_z_blocks)
+    faq_result  = search_notion_faq(search_q)
+    _z_blocks   = search_zendesk_ticket_blocks(search_q)
+    _z_rows     = _zendesk_blocks_to_lines(_z_blocks)
     zendesk_result_text = _zendesk_lines_to_text(_z_rows)
-    slack_result = search_slack_channels(corrected_query) or "🙅 Slack内で関連するメッセージが見つかりませんでした。"
-    gmail_result = _search_gmail_first_account(corrected_query) or "📭 メールが見つかりませんでした。"
+    slack_result = search_slack_channels(search_q) or "🙅 Slack内で関連するメッセージが見つかりませんでした。"
+    gmail_result = _search_gmail_first_account(search_q) or "📭 メールが見つかりませんでした。"
 
     print("[SRC] FAQ len:", len(faq_result or ""))
     print("[SRC] ZD  hits:", 0 if (zendesk_result_text or "").startswith("🙅") else len((zendesk_result_text or "").splitlines()))
     print("[SRC] SLK hit?:", not (slack_result or "").startswith("🙅"))
     print("[SRC] GML hit?:", not (gmail_result or "").startswith(("📭","❌")))
+
+    if all(_nohit(x) for x in [faq_result, zendesk_result_text, slack_result, gmail_result]):
+        ai_kws = extract_keywords_ai(corrected_query)
+        if ai_kws:
+            search_q2 = build_search_text(ai_kws)
+            print(f"[SEARCH] retry q='{search_q2}'", flush=True)
+
+            faq_result  = search_notion_faq(search_q2)
+            _z_blocks   = search_zendesk_ticket_blocks(search_q2)
+            _z_rows     = _zendesk_blocks_to_lines(_z_blocks)
+            zendesk_result_text = _zendesk_lines_to_text(_z_rows)
+            slack_result = search_slack_channels(search_q2) or "🙅 Slack内で関連するメッセージが見つかりませんでした。"
+            gmail_result = _search_gmail_first_account(search_q2) or "📭 メールが見つかりませんでした。"
 
     if all(_nohit(x) for x in [faq_result, zendesk_result_text, slack_result, gmail_result]):
         return send_faq_with_feedback(
@@ -1162,15 +1209,15 @@ def handle_mention_events(body, say):
 
     prompt = (
         f"ユーザーからの質問: {corrected_query}\n\n"
-        f"以下は関連検索結果（重要度順）。これ『のみ』を根拠に答えること。\n\n"
+        f"以下の資料『のみ』を根拠に、上位3つの異なる解決案を作成せよ。\n"
         f"■ FAQ:\n{faq_result}\n\n"
         f"■ Zendesk(上位):\n{zendesk_result_text}\n\n"
         f"■ Slack:\n{slack_result}\n\n"
         f"■ Gmail:\n{gmail_result}\n\n"
-        "要件:\n"
-        "- ヒットが1つでもある場合、『見つかりませんでした／情報が不十分』とは書かない。\n"
-        "- 最も関連する事実を2〜3文で要約。Zendeskは #ID と件名を明記し、可能ならURLも示す。\n"
-        "- 足りない点があるなら、次の具体アクション（参照すべきチケットIDや連絡先）を1つ提案。\n"
+        "出力要件:\n"
+        "- 3案ちょうど出す。各案は2文以内。重複は避ける。\n"
+        "- それぞれ『見出し: 一行』『要点: 一行』の順で簡潔に。\n"
+        "- 各案の間は区切り線だけの行『---』で区切る。前置きや余計な文は禁止。\n"
     )
     try:
         r = OAI.chat.completions.create(
@@ -1188,11 +1235,22 @@ def handle_mention_events(body, say):
             ],
             temperature=0.2
         )
-        ai_answer = r.choices[0].message.content
+        raw = (r.choices[0].message.content or "").strip()
+        parts = [p.strip() for p in raw.split("---") if p.strip()]
+        top3 = parts[:3] if len(parts) >= 3 else [raw]
     except Exception as e:
-        ai_answer = f"❌ OpenAI API 呼び出し失敗: {str(e)}"
+        top3 = [f"❌ OpenAI API 呼び出し失敗: {str(e)}"]
 
-    send_faq_with_feedback(say, "AI回答", ai_answer, "ai", corrected_query, user=user_id)
+    # 3件を個別に送信（各案に独立フィードバック）
+    for i, ans in enumerate(top3, start=1):
+        send_faq_with_feedback(
+            say,
+            title=f"AI回答 候補{i}",
+            answer=ans,
+            faq_id=f"ai-{i}",
+            corrected_query=corrected_query,
+            user=user_id
+        )
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 14) Gmail 신규/범위 수집
