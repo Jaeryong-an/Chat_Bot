@@ -288,6 +288,9 @@ def unified_score(query: str, text: str, title: str | None = None,
     # 최종 스코어
     return 2.0 * bm25 + 3.0 * phrase_bonus + 2.0 * prox
 
+def _strip_links(s: str) -> str:
+    return re.sub(r"<[^>]+>", "", str(s or ""))
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 3) GSheet 헬퍼 (서비스계정 JSON env 로 단일화)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -802,11 +805,6 @@ def search_gmail(keyword, refresh_token, max_results=3):
     docs.sort(key=g_score, reverse=True)
 
     # 용어 최소 겹침 필터(안전장치)
-    def _min_overlap_ok(subject: str, preview: str, terms: list[str]) -> bool:
-        lc = (_normalize_query(subject) + " " + _normalize_query(preview)).lower()
-        hits = sum(t.lower() in lc for t in terms)
-        return hits >= max(1, (len(terms)+1)//2)
-
     filtered_meta = [d["m"] for d in docs if _min_overlap_ok(d["m"]["subject"], d["m"]["preview"], terms)]
     if not filtered_meta:
         return "📭 メールが見つかりませんでした。"
@@ -908,8 +906,6 @@ def extract_keywords_jp(text):
             kws.append(t.base_form)
     return kws
 
-from difflib import SequenceMatcher
-
 def search_notion_faq(keyword, top_k=3):
     terms = _split_terms(keyword)
     database_ids = os.getenv("FAQ_DATABASE_ID", "").split(",")
@@ -977,7 +973,7 @@ def search_notion_faq(keyword, top_k=3):
         props = d["r"].get("properties", {}) or {}
         title = d["title"]
         answer = _get_answer(props)
-        out.append(f"📌 *{title}*\n📝 {answer[:200]}{'...' if len(answer) > 200 else ''}")
+        out.append(f"📌 *{title}*\n📝 {answer[:600]}{'...' if len(answer) > 600 else ''}")
     return "\n\n".join(out)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1228,6 +1224,28 @@ def _zendesk_env_guard():
     if not sub or sub.lower()=="none" or not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", sub):
         raise RuntimeError(f"Invalid ZENDESK_SUBDOMAIN: {sub!r}")
 
+# 8) Zendesk 끝쪽(helpers 근처)에 추가
+def build_zendesk_evidence_with_excerpt(rows, max_chars=600):
+    sub = os.getenv("ZENDESK_SUBDOMAIN")
+    email = os.getenv("ZENDESK_EMAIL")
+    token = (os.getenv("ZENDESK_API_TOKEN") or "").strip()
+    if not rows:
+        return ""
+    ids = ",".join(str(r["id"]) for r in rows)
+    url = f"https://{sub}.zendesk.com/api/v2/tickets/show_many.json?ids={ids}"
+    try:
+        res = http_get(url, auth=(f"{email}/token", token), timeout=15)
+        if res.status_code != 200:
+            return _zendesk_evidence(rows, max_chars)
+        out = []
+        for t in (res.json().get("tickets") or []):
+            subj = t.get("subject","")
+            desc = _normalize_query_for_zendesk(t.get("description",""))[:300]
+            out.append(f"#{t.get('id')} {subj} :: {desc}")
+        return "; ".join(out)[:max_chars]
+    except Exception:
+        return _zendesk_evidence(rows, max_chars)
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 9) 의도/키워드
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1377,7 +1395,7 @@ def reminder_or_autosave(session_key, user_id, faq_id, question, client):
             print(f"❌ Google Sheets 保存失敗: {e}")
         try:
             client.chat_postMessage(
-                channel="feedback-momentum",
+                channel=_channel_id("SLACK_CHANNEL_FEEDBACK"),
                 text=(f"📝 フィードバック（自動保存）\n"
                       f"*質問:* {question}\n"
                       f"*ユーザー:* <@{user_id}>\n"
@@ -1412,7 +1430,7 @@ def handle_additional_comment(body, say, client):
 
         save_feedback_to_gsheet(faq_id, question, user, "no", comment=text)
         client.chat_postMessage(
-            channel="feedback_momentum",
+            channel=_channel_id("SLACK_CHANNEL_FEEDBACK"),
             
             text=(f"📝 フィードバックコメント受信\n"
                   f"*質問:* {question}\n"
@@ -1478,7 +1496,6 @@ def _to_text(name: str, val: Any, limit_items: int = 10, limit_chars: int = 2000
 # ─────────────────────────────────────────────────────────────
 # 要約呼び出し
 # ─────────────────────────────────────────────────────────────
-import os
 OPENAI_MODEL_SUMMARY = os.getenv("OPENAI_MODEL_SUMMARY", "gpt-4o")
 
 def summarize_search_outputs_ja(query: str, notion: Any, zendesk: Any, slack: Any, gmail: Any, max_tokens: int = 300) -> str:
@@ -1607,28 +1624,30 @@ def handle_mention_events(body, say):
     # ── LLMへ渡す入力を「件数付き・短文化」に変換（ここが主変更点）
     notion_cnt = 0 if _nohit_or_err(faq_result) else 1
     z_cnt      = len(_z_rows)
-    sg_cnt     = 1 if (_sg_hit(slack_result) or _sg_hit(gmail_result)) else 0
 
-    zendesk_evi    = _zendesk_evidence(_z_rows)  # URL無しの証拠
+    zendesk_evi    = build_zendesk_evidence_with_excerpt(_z_rows)
     notion_for_llm = _decorate_with_count("" if notion_cnt == 0 else safe_block_text(str(faq_result), 400), notion_cnt)
     z_for_llm      = _decorate_with_count(zendesk_evi, z_cnt)
 
-    sg_text = ""
-    if _sg_hit(slack_result):
-        sg_text += safe_block_text(str(slack_result), 200)
-    if _sg_hit(gmail_result):
-        sg_text += (" / " if sg_text else "") + safe_block_text(str(gmail_result), 200)
-    sg_for_llm = _decorate_with_count(sg_text, sg_cnt)
+
+    slack_for_llm = _decorate_with_count(
+        safe_block_text(_strip_links(slack_result), 400),
+        1 if _sg_hit(slack_result) else 0
+    )
+    gmail_for_llm = _decorate_with_count(
+        safe_block_text(_strip_links(gmail_result), 400),
+        1 if _sg_hit(gmail_result) else 0
+    )
 
     # ── 要約と回答生成（ZendeskがN>0で「該当なし」を出させない）
     summary_ja = summarize_search_outputs_ja(
-        corrected_query, notion_for_llm, z_for_llm, sg_for_llm, ""
+        corrected_query, notion_for_llm, z_for_llm, slack_for_llm, gmail_for_llm
     )
     if z_cnt > 0:
         summary_ja = re.sub(r"(2\. Zendesk：)「該当なし」", r"\1「Zendeskで関連チケットあり」", summary_ja)
 
     answer_ja = generate_answer_ja(
-        corrected_query, notion_for_llm, z_for_llm, sg_for_llm, ""
+        corrected_query, notion_for_llm, z_for_llm, slack_for_llm, gmail_for_llm
     )
 
     summary_bold = "*⭐️要約⭐️：*\n" + "\n".join(
@@ -1640,22 +1659,23 @@ def handle_mention_events(body, say):
         notion_txt  = f"1. Notion：\n{faq_result if not _nohit_or_err(faq_result) else _nohit_text(faq_result)}"
         zendesk_txt = f"2. Zendesk：\n{zendesk_result_text if not _nohit_or_err(zendesk_result_text) else _nohit_text(zendesk_result_text)}"
 
-        sg_parts = []
+        # Slack
         if isinstance(slack_result, str) and slack_result in ("__ERR__", "__ERR_TIMEOUT__"):
-            sg_parts.append(f"• *Slack*\n{_nohit_text(slack_result)}")
+            slack_txt = f"• *Slack*\n{_nohit_text(slack_result)}"
         elif (isinstance(slack_result, list) and len(slack_result) > 0) or (slack_result and not _nohit(slack_result)):
-            sg_parts.append(f"• *Slack*\n{slack_result}")
+            slack_txt = f"• *Slack*\n{_strip_links(str(slack_result))}"
         else:
-            sg_parts.append(f"• *Slack*\n{_nohit_text(slack_result)}")
+            slack_txt = f"• *Slack*\n{_nohit_text(slack_result)}"
 
+        # Gmail
         if isinstance(gmail_result, str) and gmail_result in ("__ERR__", "__ERR_TIMEOUT__"):
-            sg_parts.append(f"• *Gmail*\n{_nohit_text(gmail_result)}")
+            gmail_txt = f"• *Gmail*\n{_nohit_text(gmail_result)}"
         elif gmail_result and not _nohit(gmail_result):
-            sg_parts.append(f"• *Gmail*\n{gmail_result}")
+            gmail_txt = f"• *Gmail*\n{_strip_links(str(gmail_result))}"
         else:
-            sg_parts.append(f"• *Gmail*\n{_nohit_text(gmail_result)}")
-        sg_txt = "3. Slack・Gmail：\n" + "\n".join(sg_parts)
+            gmail_txt = f"• *Gmail*\n{_nohit_text(gmail_result)}"
 
+        sg_txt = "3. Slack・Gmail：\n" + "\n".join([slack_txt, gmail_txt])
         combined = f"{summary_bold}\n\n*回答：*\n{answer_ja}\n\n{notion_txt}\n\n{zendesk_txt}\n\n{sg_txt}"
     else:
         combined = f"{summary_bold}\n\n*回答：*\n{answer_ja}"
