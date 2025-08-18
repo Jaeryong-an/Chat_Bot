@@ -49,6 +49,7 @@ from flask import Flask, request, redirect
 # 2) 전역 설정
 # ──────────────────────────────────────────────────────────────────────────────
 DEBUG = os.getenv("DEBUG_GMAIL", "0") == "1"
+SHOW_SOURCE_SNIPPETS = os.getenv("SHOW_SOURCE_SNIPPETS", "0") == "1"
 
 # ───── Janome singleton ─────
 _JANOME = Tokenizer()
@@ -415,11 +416,12 @@ def send_log_to_slack(text, channel=None, title="📘 LOG通知"):
         client = get_slack()
         channel = channel or _channel_id("SLACK_CHANNEL_LOG")
         if not channel:
-            print("⚠️ SLACK_CHANNEL_LOG 未設定のため送信スキップ")
-            return
+            print("⚠️ SLACK_CHANNEL_LOG 未設定のため送信スキップ"); return
+        alt = re.sub(r"[*_`]", "", f"{title} {text}")
         safe_post_to_slack(
             client,
             channel=channel,
+            text=alt,  # ← 추가
             blocks=[
                 {"type":"header","text":{"type":"plain_text","text":title}},
                 {"type":"section","text":{"type":"mrkdwn","text":text}},
@@ -1597,10 +1599,6 @@ def handle_mention_events(body, say):
                 zendesk_result_text = _zendesk_lines_to_text(_z_rows)
                 slack_result = _await("slack", futs2["slack"], SLACK_TIMEOUT)
                 gmail_result = _await("gmail", futs2["gmail"], 15)
-    
-    summary_ja = summarize_search_outputs_ja(
-        corrected_query, faq_result, zendesk_result_text, slack_result, gmail_result
-    )
 
     # 3섹션으로 출력
     notion_txt  = f"1. Notion：\n{faq_result if not _nohit_or_err(faq_result) else _nohit_text(faq_result)}"
@@ -1625,13 +1623,43 @@ def handle_mention_events(body, say):
         sg_parts.append(f"• *Gmail*\n{_nohit_text(gmail_result)}")
     sg_txt = "3. Slack・Gmail：\n" + "\n".join(sg_parts)
 
+    summary_ja = summarize_search_outputs_ja(
+        corrected_query, faq_result, zendesk_result_text, slack_result, gmail_result
+    )
+
     summary_bold = "*⭐️要約⭐️：*\n" + "\n".join(
         f"*{line}*" if line.strip() else "" for line in summary_ja.splitlines()
     )
     answer_ja = generate_answer_ja(
         corrected_query, faq_result, zendesk_result_text, slack_result, gmail_result
     )
-    combined = f"{summary_bold}\n\n*回答：*\n{answer_ja}\n\n{notion_txt}\n\n{zendesk_txt}\n\n{sg_txt}"
+
+    # --- 出力の組み立て（明細は既定で非表示） ---
+    if SHOW_SOURCE_SNIPPETS:
+        # 旧来の明細表示を残したい場合のみ生成
+        notion_txt  = f"1. Notion：\n{faq_result if not _nohit_or_err(faq_result) else _nohit_text(faq_result)}"
+        zendesk_txt = f"2. Zendesk：\n{zendesk_result_text if not _nohit_or_err(zendesk_result_text) else _nohit_text(zendesk_result_text)}"
+
+        sg_parts = []
+        if isinstance(slack_result, str) and slack_result in ("__ERR__", "__ERR_TIMEOUT__"):
+            sg_parts.append(f"• *Slack*\n{_nohit_text(slack_result)}")
+        elif (isinstance(slack_result, list) and len(slack_result) > 0) or (slack_result and not _nohit(slack_result)):
+            sg_parts.append(f"• *Slack*\n{slack_result}")
+        else:
+            sg_parts.append(f"• *Slack*\n{_nohit_text(slack_result)}")
+
+        if isinstance(gmail_result, str) and gmail_result in ("__ERR__", "__ERR_TIMEOUT__"):
+            sg_parts.append(f"• *Gmail*\n{_nohit_text(gmail_result)}")
+        elif gmail_result and not _nohit(gmail_result):
+            sg_parts.append(f"• *Gmail*\n{gmail_result}")
+        else:
+            sg_parts.append(f"• *Gmail*\n{_nohit_text(gmail_result)}")
+        sg_txt = "3. Slack・Gmail：\n" + "\n".join(sg_parts)
+
+        combined = f"{summary_bold}\n\n*回答：*\n{answer_ja}\n\n{notion_txt}\n\n{zendesk_txt}\n\n{sg_txt}"
+    else:
+        # 明細を完全に非表示
+        combined = f"{summary_bold}\n\n*回答：*\n{answer_ja}"
 
     send_faq_with_feedback(
         say,
