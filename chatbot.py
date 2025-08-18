@@ -163,12 +163,6 @@ def _split_terms(text: str):
             out.append(t)
     return out
 
-def build_search_text(q: str) -> str:
-    phrase = _normalize_query(q)
-    terms = _split_terms(q)
-    terms = terms[:8]
-    return (f"\"{phrase}\" " if phrase else "") + " ".join(terms)
-
 def safe_post_to_slack(client: WebClient, **kwargs):
     for i in range(5):
         try:
@@ -400,7 +394,7 @@ def search_slack_channels(keyword, days_min=30, days_plan=(30, 90, 180, 365),
                     overlap = sum(1 for t in terms if t.lower() in text.lower())
                     if sentence and sentence.lower() in text.lower():
                         s = 999 + overlap  # 강한 부스트
-                    elif overlap < max(1, len(terms)//3):
+                    elif overlap < max(1, (len(terms)+1)//2):
                         continue
                     else:
                         s = _slack_score(terms, sentence, text)
@@ -456,14 +450,14 @@ def search_slack_channels(keyword, days_min=30, days_plan=(30, 90, 180, 365),
 def _gmail_queries(keyword: str, label_filter: str):
     sent  = _normalize_query(keyword)
     terms = _split_terms(keyword)
-    filt  = ' -in:spam -in:trash' + (f' label:"{label_filter}"' if label_filter else "")
+    filt  = ' -in:spam -in:trash' + (f' label:{label_filter}' if label_filter else "")
     qs = []
-    if sent:
-        qs.append(f'"{sent}"{filt}')  # 문장 프레이즈
     if terms:
-        qs.append('({}){}'.format(" OR ".join([f'"{t}"' for t in terms]), filt))
-        qs.append(f'{" ".join(terms)}{filt}')  # 자유어
-    return qs or [filt.strip()]
+        qs.append(f'{" ".join(terms)}{filt}')                       # AND 기본
+        qs.append(f'{" ".join("subject:"+t for t in terms)}{filt}') # 제목 집중
+    else:
+        qs.append(filt.strip())
+    return qs
 
 def _gmail_score(terms, subject, preview, sender=""):
     s = _normalize_query(subject).lower()
@@ -473,6 +467,11 @@ def _gmail_score(terms, subject, preview, sender=""):
     hit_p = sum(t.lower() in p for t in terms) * 2
     hit_f = sum(t.lower() in f for t in terms)
     return hit_s + hit_p + hit_f
+
+def _min_overlap_ok(subject: str, preview: str, terms: list[str]) -> bool:
+    lc = (_normalize_query(subject) + " " + _normalize_query(preview)).lower()
+    hits = sum(t.lower() in lc for t in terms)
+    return hits >= max(1, (len(terms)+1)//2)
 
 
 def refresh_gmail_token_for(refresh_token):
@@ -658,11 +657,14 @@ def search_gmail(keyword, refresh_token, max_results=3):
     for m in found_meta[:K]:
         m["preview"] = id2preview.get(m["id"], "")
     found_meta.sort(key=lambda m: _gmail_score(terms, m["subject"], m["preview"], m["from"]), reverse=True)
+    filtered_meta = [m for m in found_meta if _min_overlap_ok(m["subject"], m["preview"], terms)]
+    if not filtered_meta:
+        return "📭 メールが見つかりませんでした。"
 
     # ⑤ 출력
     slog("gmail.used_query", q=used_q or "(none)")
     lines = []
-    for m in found_meta[:max_results]:
+    for m in filtered_meta[:max_results]:
         lines.append(f"📧 *{m['subject']}*\n送信者: {m['from']}\n")
     return "\n".join(lines)
 
@@ -802,7 +804,11 @@ def search_notion_faq(keyword):
     q_text = _normalize_query(keyword)
     def _score(props):
         txt = _notion_collect_text(props)
-        exact = sum(1 for t in terms if t in txt) * 3
+        hits = sum(1 for t in terms if t in txt)
+        # 최소 50% 용어가 문서에 있어야 후보로 인정
+        if hits < max(1, (len(terms)+1)//2):
+            return 0
+        exact = hits * 5            # 가중치 상향
         fuzzy = int(100 * SequenceMatcher(None, q_text, txt[:2000]).ratio()) // 10
         return exact + fuzzy
 
@@ -853,44 +859,28 @@ def _zendesk_terms(keyword: str):
 
 # 全角/半角・大文字小文字・ワイルドカードを含めて検索語を拡張
 def _zendesk_queries(keyword: str):
-    sent  = _normalize_query_for_zendesk(keyword)
-    if not sent:
+    terms = [t for t in _zendesk_terms(keyword) if t.strip()][:6]
+    if not terms:
         return []
 
-    # 基本トークン
-    base = sent.strip()
-    # バリアント
-    variants = {
-        base,
-        base.lower(),
-        base.title(),  # 先頭大文字: Criteo
-        _to_fullwidth_ascii(base),
-        _to_halfwidth_ascii(_to_fullwidth_ascii(base)),
-    }
-    # ワイルドカードも足す（Zendeskは末尾*対応）
-    wc = {v + "*" for v in list(variants) if len(v) >= 3}
-    variants |= wc
+    # ① 가장 엄격: AND (type:ticket + 공백 AND)
+    q_and = "type:ticket " + " ".join(terms)
 
-    # 句として安全にする
-    quoted = [f'"{v}"' for v in variants]
+    # ② 중간: 필드別 OR (subject/description/tags)
+    field_terms = []
+    for t in terms:
+        field_terms.append(f"subject:{t}")
+        field_terms.append(f"description:{t}")
+        field_terms.append(f"tags:{t}")
+    q_fields_or = "type:ticket (" + " OR ".join(field_terms) + ")"
 
-    def fields(q: str) -> str:
-        return f"subject:{q} OR description:{q} OR comment:{q} OR tags:{q}"
+    # ③ 완화: type:ticket + 자유어
+    q_broad = "type:ticket (" + " ".join(terms) + ")"
 
-    qs = []
-    # ① チケット限定のフレーズ検索（ワイルドカード含む）を最優先
-    qs.append("type:ticket (" + " OR ".join(quoted) + ")")
+    # ④ 최후: 자유어
+    q_fallback = " ".join(terms)
 
-    # ② 各フィールドに対するフレーズ検索
-    qs.append("type:ticket (" + " OR ".join(fields(q) for q in quoted) + ")")
-
-    # ③ 自由語OR（フレーズで統一）
-    qs.append("type:ticket (" + " OR ".join(quoted) + ")")
-
-    # ④ 最後の保険: type指定なし自由語
-    qs.append(sent)
-
-    return qs
+    return [q_and, q_fields_or, q_broad, q_fallback]
 
 import requests
 
@@ -1346,9 +1336,9 @@ def summarize_search_outputs_ja(query: str, notion: Any, zendesk: Any, slack: An
             ],
             temperature=0.2,
             max_tokens=max_tokens,
-            request_timeout=20,
+            timeout=20,
         )
-        return resp["choices"][0]["message"]["content"].strip()
+        return resp.choices[0].message.content.strip()
     except Exception as e:
         return f"（要約失敗: {type(e).__name__}: {e}）"
 
@@ -1360,17 +1350,16 @@ def handle_mention_events(body, say):
     user_query = text.replace(f"<@{bot_user_id}>", "").strip()
 
     corrected_query = correct_typo_with_gpt(user_query)
-    search_q = build_search_text(corrected_query)
     print(f"[ユーザー入力] {user_query} → [修正後] {corrected_query}")
-    print(f"[SEARCH] dispatch sources=notion,zendesk,slack q='{search_q}'", flush=True)
+    print(f"[SEARCH] dispatch sources=notion,zendesk,slack q='{corrected_query}'", flush=True)
     say(text="🔎 検索中です。少々お待ちください...")
 
     with ThreadPoolExecutor(max_workers=6) as ex:
         futs = {
-            "faq":   ex.submit(search_notion_faq, search_q),
-            "zblk":  ex.submit(search_zendesk_ticket_blocks, search_q),
-            "slack": ex.submit(search_slack_channels, search_q),
-            "gmail": ex.submit(_search_gmail_first_account, search_q),
+            "faq":   ex.submit(search_notion_faq, corrected_query),
+            "zblk":  ex.submit(search_zendesk_ticket_blocks, corrected_query),
+            "slack": ex.submit(search_slack_channels, corrected_query),
+            "gmail": ex.submit(_search_gmail_first_account, corrected_query),
         }
         faq_result   = _await("faq",   futs["faq"],   15)
         _z_blocks    = _await("zblk",  futs["zblk"],  15) or []
@@ -1383,15 +1372,15 @@ def handle_mention_events(body, say):
     # 무히트면 2차: 키워드 압축 후 병렬 재검색
     if all(_nohit_or_err(x) for x in [faq_result, zendesk_result_text, slack_result, gmail_result]):
         ai_kws = extract_keywords_ai(corrected_query)
+        kw2 = ai_kws or corrected_query
         if ai_kws:
-            search_q2 = build_search_text(ai_kws)
-            print(f"[SEARCH] retry q='{search_q2}'", flush=True)
+            print(f"[SEARCH] retry q='{kw2}'", flush=True)
             with ThreadPoolExecutor(max_workers=6) as ex:
                 futs2 = {
-                    "faq":   ex.submit(search_notion_faq, search_q2),
-                    "zblk":  ex.submit(search_zendesk_ticket_blocks, search_q2),
-                    "slack": ex.submit(search_slack_channels, search_q2),
-                    "gmail": ex.submit(_search_gmail_first_account, search_q2),
+                    "faq":   ex.submit(search_notion_faq, kw2),
+                    "zblk":  ex.submit(search_zendesk_ticket_blocks, kw2),
+                    "slack": ex.submit(search_slack_channels, kw2),
+                    "gmail": ex.submit(_search_gmail_first_account, kw2),
                 }
                 faq_result   = _await("faq",   futs2["faq"],   15)
                 _z_blocks    = _await("zblk",  futs2["zblk"],  15) or []
@@ -1790,7 +1779,7 @@ def _load_gmail_accounts():
         except Exception:
             return []
     try:
-        with open("_load_gmail_accounts()") as f:
+        with open("gmail_accounts.json") as f:
             return json.load(f).get("accounts", [])
     except Exception:
         return []
