@@ -366,7 +366,8 @@ def get_channel_ids_from_env():
     return [c.strip() for c in val.split(",") if c.strip()]
 
 def search_slack_channels(keyword, days_min=30, days_plan=(30, 90, 180, 365),
-                          target_hits=200, per_channel_cap=300, global_cap=1000):
+                          target_hits=200, per_channel_cap=300, global_cap=1000,
+                          top_k=3):
     client = get_slack()
     channels = get_channel_ids_from_env()
     if not channels:
@@ -374,16 +375,14 @@ def search_slack_channels(keyword, days_min=30, days_plan=(30, 90, 180, 365),
     sentence = _normalize_query(keyword)
     terms = _split_terms(keyword)
 
-    # 시간 예산(초)
     budget_sec = float(os.getenv("SLACK_BUDGET_SEC", "20"))
     deadline = time.monotonic() + budget_sec
 
-    # 기간 해제 트리거
     unlimited = any(w in keyword.lower() for w in ("alltime", "全期間", "全て", "전체"))
     windows = [None] if unlimited else list(days_plan)
 
     def ts_oldest(days):
-        return None if days is None else f"{time.time() - days*86400:.6f}"  # ← 변경: str ts
+        return None if days is None else f"{time.time() - days*86400:.6f}"
 
     best_scored = []
     for days in windows:
@@ -391,11 +390,9 @@ def search_slack_channels(keyword, days_min=30, days_plan=(30, 90, 180, 365),
         slog("slack.query", channels=",".join(channels), sentence=sentence,
              terms="|".join(terms), window_days=("unlimited" if oldest is None else days))
 
-        # 채널 병렬 수집(페이지/사이즈 보수화)
         def fetch_one(cid):
             try:
-                msgs = _slack_fetch_messages(client, cid,
-                                             max_pages=1, page_size=150,  # ← 축소
+                msgs = _slack_fetch_messages(client, cid, max_pages=1, page_size=150,
                                              oldest=oldest, max_total=per_channel_cap)
                 out = []
                 for msg in msgs:
@@ -411,8 +408,7 @@ def search_slack_channels(keyword, days_min=30, days_plan=(30, 90, 180, 365),
                         s = _slack_score(terms, sentence, text)
                     out.append((s, cid, text, msg.get("ts")))
                 return out
-            except Exception as e:
-                print(f"❌ Slack検索エラー ({cid}): {e}")
+            except Exception:
                 return []
 
         scored = []
@@ -428,17 +424,17 @@ def search_slack_channels(keyword, days_min=30, days_plan=(30, 90, 180, 365),
                 break
             continue
 
-        # 2패스 랭킹
         scored.sort(key=lambda x: x[0], reverse=True)
         coarse_top = scored[:300]
+
         def refine(t):
             _, cid, text, ts = t
             q = set(terms); d = set(_split_terms(text))
             jacc = len(q & d) / max(1, len(q | d))
             bonus = 0.2 if sentence and sentence.lower() in text.lower() else 0
             return t[0] + int(1000 * (jacc + bonus))
-        refined = sorted(coarse_top, key=refine, reverse=True)
 
+        refined = sorted(coarse_top, key=refine, reverse=True)
         best_scored = refined
         if len(refined) >= target_hits or unlimited or time.monotonic() > deadline:
             break
@@ -446,20 +442,16 @@ def search_slack_channels(keyword, days_min=30, days_plan=(30, 90, 180, 365),
     if not best_scored:
         return "🙅 Slack内で関連するメッセージが見つかりませんでした。"
 
-    # 스레드 확장: 상위 5개는 permalink로 노출
     out, seen = [], set()
     for s, cid, text, ts in best_scored:
         key = text[:200].strip()
         if key in seen:
             continue
         seen.add(key)
-        try:
-            perma = _slack_permalink(cid, ts) if ts else None
-            line = f"📌 <{perma}|#{cid}>: {text[:160]}" if perma else f"📌 <#{cid}>: {text[:160]}"
-        except Exception:
-            line = f"📌 <#{cid}>: {text[:160]}"
+        perma = _slack_permalink(cid, ts) if ts else None
+        line = f"📌 <{perma}|#{cid}>: {text[:160]}" if perma else f"📌 <#{cid}>: {text[:160]}"
         out.append(line)
-        if len(out) >= 10:
+        if len(out) >= top_k: 
             break
     return "\n".join(out)
 
@@ -786,7 +778,9 @@ def extract_keywords_jp(text):
             kws.append(t.base_form)
     return kws
 
-def search_notion_faq(keyword):
+from difflib import SequenceMatcher
+
+def search_notion_faq(keyword, top_k=3):
     terms = _split_terms(keyword)
     database_ids = os.getenv("FAQ_DATABASE_ID", "").split(",")
     headers = _notion_headers()
@@ -797,10 +791,8 @@ def search_notion_faq(keyword):
             continue
         text_props = _notion_text_props(db_id)[:6]
         if not text_props:
-            print(f"⚠️ Notion: text propsなし ({db_id})")
             continue
 
-        # ← ここから: or_filters は一度だけ構築
         props_meta = _notion_props(db_id)
         or_filters = []
         for t in terms[:6]:
@@ -810,49 +802,41 @@ def search_notion_faq(keyword):
 
         payload = {"filter": {"or": or_filters}} if or_filters else {}
         slog("notion.query", db_id=db_id, props="|".join(text_props), terms="|".join(terms), filters=len(or_filters))
-
         r = http_post(f"https://api.notion.com/v1/databases/{db_id}/query",
-                    headers=headers, json=payload)
-        print(f"[NOTION] status={r.status_code} bytes={len(r.text)}")
+                      headers=headers, json=payload)
+        if r.status_code != 200:
+            continue
 
-        if r.status_code == 200:
+        data = r.json() or {}
+        results = data.get("results") or []
+        all_results.extend(results)
+        while data.get("has_more") and data.get("next_cursor"):
+            r = http_post(f"https://api.notion.com/v1/databases/{db_id}/query",
+                          headers=headers, json={**payload, "start_cursor": data["next_cursor"]})
+            if r.status_code != 200:
+                break
             data = r.json() or {}
-            results = data.get("results") or []
-            print(f"[NOTION] hits={len(results)}")
-            all_results.extend(results)
-
-            while data.get("has_more") and data.get("next_cursor"):
-                r = http_post(
-                    f"https://api.notion.com/v1/databases/{db_id}/query",
-                    headers=headers,
-                    json={**payload, "start_cursor": data["next_cursor"]},
-                )
-                if r.status_code != 200:
-                    break
-                data = r.json() or {}
-                results = data.get("results") or []
-                all_results.extend(results)
+            all_results.extend(data.get("results") or [])
         else:
             print(f"[NOTION] error-body={r.text[:200]}")
 
     if not all_results:
         return "🙅 関連するFAQが見つかりませんでした。"
 
-    # 以降は既存の再ランキング処理そのまま
     q_text = _normalize_query(keyword)
+
     def _score(props):
         txt = _notion_collect_text(props)
         hits = sum(1 for t in terms if t in txt)
-        # 최소 50% 용어가 문서에 있어야 후보로 인정
         if hits < max(1, (len(terms)+1)//2):
             return 0
-        exact = hits * 5            # 가중치 상향
+        exact = hits * 5
         fuzzy = int(100 * SequenceMatcher(None, q_text, txt[:2000]).ratio()) // 10
         return exact + fuzzy
 
     ranked = sorted(((_score(r.get("properties", {}) or {}), r) for r in all_results),
                     key=lambda x: x[0], reverse=True)
-    top = [r for s, r in ranked if s > 0][:5]
+    top = [r for s, r in ranked if s > 0][:top_k]
     if not top:
         return "🙅 入力内容と類似するFAQが見つかりませんでした。"
 
@@ -990,7 +974,7 @@ def search_zendesk_ticket_text(keyword):
     return "\n".join(f"#{t.get('id','')} {t.get('subject','(件名不明)')} [status:{t.get('status','?')}]"
                      for t in ranked[:5])
 
-def search_zendesk_ticket_blocks(keyword):
+def search_zendesk_ticket_blocks(keyword, top_k=3):
     subdomain = os.getenv("ZENDESK_SUBDOMAIN")
     email = os.getenv("ZENDESK_EMAIL")
     token = (os.getenv("ZENDESK_API_TOKEN") or "").strip()
@@ -999,14 +983,8 @@ def search_zendesk_ticket_blocks(keyword):
 
     results = []
     for q in _zendesk_queries(keyword):
-        slog("zendesk.query", q=q)  # [FIX]
-        try:  # [FIX]
-            items = _zendesk_search_all(url, auth, q)
-            items = [it for it in items if it.get("result_type") == "ticket"]
-        except Exception as e:  # [FIX]
-            import traceback
-            slog("zendesk.error", err=str(e), tb=traceback.format_exc())
-            items = []
+        items = _zendesk_search_all(url, auth, q)
+        items = [it for it in items if it.get("result_type") == "ticket"]
         if items:
             results = items
             break
@@ -1025,8 +1003,10 @@ def search_zendesk_ticket_blocks(keyword):
     ranked = sorted(results, key=score, reverse=True)
 
     blocks = [{"type":"section","text":{"type":"mrkdwn","text":"*🎫 Zendesk チケット検索結果:*"}}]
-    for t in ranked[:5]:
-        tid = t.get("id",""); subject = t.get("subject","(件名不明)"); status = t.get("status","(ステータス不明)")
+    for t in ranked[:top_k]:
+        tid = t.get("id","")
+        subject = t.get("subject","(件名不明)")
+        status = t.get("status","(ステータス不明)")
         turl = f"https://{subdomain}.zendesk.com/agent/tickets/{tid}"
         blocks.append({"type":"section","text":{"type":"mrkdwn","text":f"*<{turl}|#{tid} - {subject}>*\nステータス: `{status}`"}})
         blocks.append({"type":"divider"})
@@ -1387,6 +1367,42 @@ def summarize_search_outputs_ja(query: str, notion: Any, zendesk: Any, slack: An
     except Exception as e:
         return f"（要約失敗: {type(e).__name__}: {e}）"
 
+OPENAI_MODEL_ANSWER = os.getenv("OPENAI_MODEL_ANSWER", "gpt-4o")
+
+def generate_answer_ja(query: str, notion: Any, zendesk: Any, slack: Any, gmail: Any, max_tokens: int = 380) -> str:
+    """検索結果だけに基づき日本語で最終回答を作る（推測禁止）"""
+    pieces = [
+        _to_text("Notion", notion),
+        _to_text("Zendesk", zendesk),
+        _to_text("Slack", slack),
+        _to_text("Gmail", gmail),
+    ]
+    context = "\n\n".join([p for p in pieces if p]).strip()
+    if not context:
+        return "該当なし。追加情報が必要です。"
+
+    system = (
+        "あなたは厳密な社内アシスタントです。以下の【検索結果】に含まれる事実のみに基づき、"
+        "ユーザーの質問に日本語で簡潔に回答してください。推測や外部知識の持ち込みは禁止。"
+        "根拠が不足なら不足と明記し、必要な追加情報を1行で提案。最大300字、明瞭・具体的に。"
+    )
+    user = (
+        f"【ユーザー質問】\n{query}\n\n"
+        f"【検索結果】\n{context}\n\n"
+        "【出力要件】\n- 1〜2段落で要点回答。\n- 不足時は「不足: …」を1行追加。\n"
+    )
+    try:
+        resp = OAI.chat.completions.create(
+            model=OPENAI_MODEL_ANSWER,
+            messages=[{"role":"system","content":system},{"role":"user","content":user}],
+            temperature=0.2,
+            max_tokens=max_tokens,
+            timeout=20,
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        return f"（回答生成失敗: {type(e).__name__}: {e}）"
+
 @slack_app.event("app_mention")
 def handle_mention_events(body, say):
     text = body.get("event", {}).get("text", "")
@@ -1408,7 +1424,7 @@ def handle_mention_events(body, say):
         }
         faq_result   = _await("faq",   futs["faq"],   15)
         _z_blocks    = _await("zblk",  futs["zblk"],  15) or []
-        _z_rows = _zendesk_blocks_to_lines(_z_blocks)
+        _z_rows = _zendesk_blocks_to_lines(_z_blocks, limit=3)
         zendesk_result_text = _zendesk_lines_to_text(_z_rows)
         slack_result = _await("slack", futs["slack"], SLACK_TIMEOUT)
         gmail_result = _await("gmail", futs["gmail"], 15)
@@ -1429,7 +1445,7 @@ def handle_mention_events(body, say):
                 }
                 faq_result   = _await("faq",   futs2["faq"],   15)
                 _z_blocks    = _await("zblk",  futs2["zblk"],  15) or []
-                _z_rows = _zendesk_blocks_to_lines(_z_blocks)
+                _z_rows = _zendesk_blocks_to_lines(_z_blocks, limit=3)
                 zendesk_result_text = _zendesk_lines_to_text(_z_rows)
                 slack_result = _await("slack", futs2["slack"], SLACK_TIMEOUT)
                 gmail_result = _await("gmail", futs2["gmail"], 15)
@@ -1461,10 +1477,13 @@ def handle_mention_events(body, say):
         sg_parts.append(f"• *Gmail*\n{_nohit_text(gmail_result)}")
     sg_txt = "3. Slack・Gmail：\n" + "\n".join(sg_parts)
 
-    summary_bold = "*!要約!：*\n" + "\n".join(
+    summary_bold = "*⭐️要約⭐️：*\n" + "\n".join(
         f"*{line}*" if line.strip() else "" for line in summary_ja.splitlines()
     )
-    combined = f"{summary_bold}\n\n{notion_txt}\n\n{zendesk_txt}\n\n{sg_txt}"
+    answer_ja = generate_answer_ja(
+        corrected_query, faq_result, zendesk_result_text, slack_result, gmail_result
+    )
+    combined = f"{summary_bold}\n\n*回答：*\n{answer_ja}\n\n{notion_txt}\n\n{zendesk_txt}\n\n{sg_txt}"
 
     send_faq_with_feedback(
         say,
