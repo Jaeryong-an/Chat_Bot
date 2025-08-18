@@ -1216,6 +1216,8 @@ def _to_text(name: str, val: Any, limit_items: int = 10, limit_chars: int = 2000
 # ─────────────────────────────────────────────────────────────
 import os
 import openai
+
+openai.api_key = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL_SUMMARY = os.getenv("OPENAI_MODEL_SUMMARY", "gpt-5")
 
 def summarize_search_outputs_ja(query: str, notion: Any, zendesk: Any, slack: Any, gmail: Any, max_tokens: int = 300) -> str:
@@ -1261,6 +1263,7 @@ def summarize_search_outputs_ja(query: str, notion: Any, zendesk: Any, slack: An
             ],
             temperature=0.2,
             max_tokens=max_tokens,
+            request_timeout=20,
         )
         return resp["choices"][0]["message"]["content"].strip()
     except Exception as e:
