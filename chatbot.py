@@ -4,6 +4,7 @@ from typing import Optional, Any, List
 from functools import lru_cache
 import traceback
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
+import unicodedata
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1) .env 먼저 로드
@@ -71,15 +72,10 @@ _session.mount("https://", HTTPAdapter(max_retries=_retry))
 _session.mount("http://", HTTPAdapter(max_retries=_retry))
 
 def http_get(url, *, params=None, headers=None, auth=None, timeout=20, allow_redirects=True):
-    return requests.get(
-        url,
-        params=params,
-        headers=headers,
-        auth=auth,              # ← 반드시 전달
-        timeout=timeout,
-        allow_redirects=allow_redirects,
+    return _session.get(  # ← requests.get → _session.get
+        url, params=params, headers=headers, auth=auth,
+        timeout=timeout, allow_redirects=allow_redirects,
     )
-
 
 def http_post(url, **kwargs):
     kwargs.setdefault("timeout", 30)
@@ -136,7 +132,7 @@ def _to_halfwidth_ascii(s: str) -> str:
 _JP_PUNCT = r"[、。；;：:（）()【】\[\]「」『』｜\|／/・・]+"
 
 def _normalize_query(q: str) -> str:
-    q = (q or "").strip()
+    q = unicodedata.normalize("NFKC", (q or "").strip())
     q = re.sub(_JP_PUNCT, " ", q)
     q = re.sub(r"\s+", " ", q)
     return q
@@ -332,6 +328,14 @@ def send_log_to_slack(text, channel=None, title="📘 LOG通知"):
     except Exception as e:
         print(f"[⚠️ Slackログ送信失敗] {e}")
 
+@lru_cache(maxsize=2048)
+def _slack_permalink(cid: str, ts: str) -> Optional[str]:
+    try:
+        r = get_slack().chat_getPermalink(channel=cid, message_ts=ts)
+        return (r.data or {}).get("permalink") or r["permalink"]
+    except Exception:
+        return None
+
 # ───── Slack search: sentence + keywords, local rerank ─────
 def _slack_score(terms, sentence, text):
     nt = _normalize_query(text)
@@ -342,13 +346,21 @@ def _slack_score(terms, sentence, text):
     fuzz = int(10 * overlap / max(1, len(terms)))
     return phrase + exact + fuzz
 
-def _slack_fetch_messages(client, channel_id, max_pages=3, page_size=200):
-    msgs = []
-    cursor = None
+def _slack_fetch_messages(client, channel_id, max_pages=2, page_size=200, oldest=None, max_total=300):
+    msgs, cursor = [], None
     for _ in range(max_pages):
-        resp = client.conversations_history(channel=channel_id, limit=page_size, cursor=cursor)
+        resp = client.conversations_history(
+            channel=channel_id,
+            limit=page_size,
+            cursor=cursor,
+            oldest=oldest,
+            inclusive=False,
+            timeout=12,
+        )
         chunk = resp.get("messages", []) or []
         msgs.extend(chunk)
+        if len(msgs) >= max_total:
+            break
         cursor = (resp.get("response_metadata") or {}).get("next_cursor")
         if not cursor or not chunk:
             break
@@ -358,39 +370,81 @@ def get_channel_ids_from_env():
     val = os.getenv("SEARCH_CHANNELS_DB", "")
     return [c.strip() for c in val.split(",") if c.strip()]
 
-def search_slack_channels(keyword):
+def search_slack_channels(keyword, days_min=30, days_plan=(30, 90, 180, 365),
+                          target_hits=200, per_channel_cap=300, global_cap=1000):
     client = get_slack()
     channels = get_channel_ids_from_env()
     sentence = _normalize_query(keyword)
     terms = _split_terms(keyword)
 
-    slog("slack.query", channels=",".join(channels), sentence=sentence, terms="|".join(terms))
+    # 기간 해제 트리거
+    unlimited = any(w in keyword.lower() for w in ("alltime", "全期間", "全て", "전체"))
+    windows = [None] if unlimited else list(days_plan)
 
-    scored = []
-    for cid in channels:
-        try:
-            for msg in _slack_fetch_messages(client, cid):
-                text = msg.get("text") or ""
-                if not text.strip():
-                    continue
-                s = _slack_score(terms, sentence, text)
-                if s > 0:
-                    scored.append((s, cid, text))
-        except Exception as e:
-            print(f"❌ Slack検索エラー ({cid}): {e}")
+    best_scored = []
+    for days in windows:
+        oldest = None if days is None else int(time.time()) - days * 86400
+        slog("slack.query", channels=",".join(channels), sentence=sentence,
+             terms="|".join(terms), window_days=("unlimited" if oldest is None else days))
 
-    if not scored:
+        scored = []
+        for cid in channels:
+            try:
+                msgs = _slack_fetch_messages(client, cid, max_pages=2, page_size=200,
+                                             oldest=oldest, max_total=per_channel_cap)
+                for msg in msgs:
+                    text = (msg.get("text") or "").strip()
+                    if not text:
+                        continue
+                    # 1차 프리필터: 빠른 컷
+                    overlap = sum(1 for t in terms if t.lower() in text.lower())
+                    if sentence and sentence.lower() in text.lower():
+                        s = 999 + overlap  # 강한 부스트
+                    elif overlap < max(1, len(terms)//3):
+                        continue
+                    else:
+                        s = _slack_score(terms, sentence, text)
+                    scored.append((s, cid, text, msg.get("ts")))
+                    if len(scored) >= global_cap:
+                        break
+            except Exception as e:
+                print(f"❌ Slack検索エラー ({cid}): {e}")
+            if len(scored) >= global_cap:
+                break
+
+        # 2패스 랭킹: 상위 K에만 정밀 재랭크
+        scored.sort(key=lambda x: x[0], reverse=True)
+        coarse_top = scored[:400]
+        def refine(t):
+            _, cid, text, ts = t
+            # 토큰 Jaccard + 문장 포함 보너스
+            q = set(terms); d = set(_split_terms(text))
+            jacc = len(q & d) / max(1, len(q | d))
+            bonus = 0.2 if sentence and sentence.lower() in text.lower() else 0
+            return t[0] + int(1000 * (jacc + bonus))
+        refined = sorted(coarse_top, key=refine, reverse=True)
+
+        best_scored = refined
+        if len(refined) >= target_hits or unlimited:
+            break  # 충분히 모였으면 확장 중단
+
+    if not best_scored:
         return "🙅 Slack内で関連するメッセージが見つかりませんでした。"
 
-    # 정렬 및 중복 제거
-    scored.sort(key=lambda x: x[0], reverse=True)
-    seen, out = set(), []
-    for _, cid, text in scored:
-        key = text.strip()[:200]
+    # 스레드 확장: 상위 5개는 permalink로 노출
+    out = []
+    seen = set()
+    for s, cid, text, ts in best_scored:
+        key = text[:200].strip()
         if key in seen:
             continue
         seen.add(key)
-        out.append(f"📌 <#{cid}>: {text.strip()[:160]}")
+        try:
+            perma = _slack_permalink(cid, ts) if ts else None
+            line = f"📌 <{perma}|#{cid}>: {text[:160]}" if perma else f"📌 <#{cid}>: {text[:160]}"
+        except Exception:
+            line = f"📌 <#{cid}>: {text[:160]}"
+        out.append(line)
         if len(out) >= 10:
             break
     return "\n".join(out)
@@ -411,12 +465,15 @@ def _gmail_queries(keyword: str, label_filter: str):
         qs.append(f'{" ".join(terms)}{filt}')  # 자유어
     return qs or [filt.strip()]
 
-def _gmail_score(terms, subject, preview):
-    txt = _normalize_query(f"{subject} {preview}").lower()
-    exact = sum(1 for t in terms if t.lower() in txt) * 3
-    overlap = len([t for t in terms if t.lower() in txt])
-    fuzz = int(10 * overlap / max(1, len(terms)))
-    return exact + fuzz
+def _gmail_score(terms, subject, preview, sender=""):
+    s = _normalize_query(subject).lower()
+    p = _normalize_query(preview).lower()
+    f = _normalize_query(sender).lower()
+    hit_s = sum(t.lower() in s for t in terms) * 4
+    hit_p = sum(t.lower() in p for t in terms) * 2
+    hit_f = sum(t.lower() in f for t in terms)
+    return hit_s + hit_p + hit_f
+
 
 def refresh_gmail_token_for(refresh_token):
     url = "https://oauth2.googleapis.com/token"
@@ -510,7 +567,7 @@ def extract_email_body(payload):
 
     return "(本文なし)"
 
-def search_gmail(keyword, refresh_token, max_results=5):
+def search_gmail(keyword, refresh_token, max_results=3):
     token = refresh_gmail_token_for(refresh_token)
     if not token:
         return "❌ Gmailアクセストークンの更新に失敗しました。"
@@ -519,54 +576,101 @@ def search_gmail(keyword, refresh_token, max_results=5):
     headers = {"Authorization": f"Bearer {token}"}
     base_url = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
 
-    found = []
+    found_meta = []
     used_q = None
+    # ① 목록 조회: fields 축소
     for q in _gmail_queries(keyword, label_filter):
         slog("gmail.query", q=q)
-        res = http_get(base_url, headers=headers, params={"q": q, "maxResults": max_results * 4})
+        res = http_get(
+            base_url, headers=headers,
+            params={"q": q, "maxResults": max_results * 6, "fields": "messages/id,nextPageToken"},
+            timeout=15,
+        )
         if res.status_code != 200:
             return f"❌ Gmail検索エラー: {res.text}"
         ids = [m.get("id") for m in (res.json().get("messages") or []) if m.get("id")]
         if not ids:
             continue
         used_q = q
-        # 상세 조회
-        for mid in ids:
-            det = http_get(f"{base_url}/{mid}", headers=headers)
-            if det.status_code != 200:
-                continue
-            payload = det.json()
-            hdrs = payload.get("payload", {}).get("headers", [])
+
+        # ② 메타 병렬 조회: Subject/From/Date 만
+        def _fetch_meta(mid):
+            r = http_get(
+                f"{base_url}/{mid}", headers=headers,
+                params={"format": "metadata",
+                        "metadataHeaders": ["Subject", "From", "Date"],
+                        "fields": "id,payload/headers"},
+                timeout=12,
+            )
+            if r.status_code != 200:
+                return None
+            payload = r.json()
+            hdrs = (payload.get("payload") or {}).get("headers") or []
             subject = sender = date_str = "(不明)"
             for h in hdrs:
                 n = h.get("name")
                 if n == "Subject": subject = h.get("value", "(不明)")
                 elif n == "From":  sender  = h.get("value", "(不明)")
                 elif n == "Date":  date_str= h.get("value", "(不明)")
-            preview = extract_email_body(payload).strip().replace("\n", " ").replace("\r", "")[:500]
-            found.append({"subject": subject, "from": sender, "date": date_str, "preview": preview})
-        if found:
-            break
+            return {"id": payload.get("id"), "subject": subject, "from": sender, "date": date_str, "preview": ""}
 
-    if not found:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        metas = []
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futs = {ex.submit(_fetch_meta, mid): mid for mid in ids[: max_results * 4]}
+            for fu in as_completed(futs):
+                m = fu.result()
+                if m: metas.append(m)
+        if metas:
+            found_meta = metas
+            break  # 첫 히트 쿼리에서 종료
+
+    if not found_meta:
         return "📭 メールが見つかりませんでした。"
 
-    # 로컬 재랭킹
+    # ③ 로컬 랭크(메타만)
     terms = _split_terms(keyword)
-    found.sort(key=lambda m: _gmail_score(terms, m["subject"], m["preview"]), reverse=True)
+    found_meta.sort(key=lambda m: _gmail_score(terms, m["subject"], "", m["from"]), reverse=True)
 
-    # 출력
+    # ④ 상위 K건만 본문(full) 재조회
+    K = min(5, max_results)  # 본문 추출 상한
+    top_ids = [m["id"] for m in found_meta[:K]]
+
+    def _fetch_body(mid):
+        r = http_get(
+            f"{base_url}/{mid}", headers=headers,
+            params={"format": "full", "fields": "id,payload/parts,payload/body"},
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return mid, ""
+        payload = r.json()
+        return mid, extract_email_body(payload).strip().replace("\n", " ").replace("\r", "")[:500]
+
+    id2preview = {}
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futs = {ex.submit(_fetch_body, mid): mid for mid in top_ids}
+        for fu in as_completed(futs):
+            mid, prev = fu.result()
+            id2preview[mid] = prev
+
+    # 미리보기 반영 후 최종 재정렬
+    for m in found_meta[:K]:
+        m["preview"] = id2preview.get(m["id"], "")
+    found_meta.sort(key=lambda m: _gmail_score(terms, m["subject"], m["preview"], m["from"]), reverse=True)
+
+    # ⑤ 출력
     slog("gmail.used_query", q=used_q or "(none)")
     lines = []
-    for m in found[:max_results]:
+    for m in found_meta[:max_results]:
         lines.append(f"📧 *{m['subject']}*\n送信者: {m['from']}\n")
     return "\n".join(lines)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 7) Notion FAQ 검색
 # ──────────────────────────────────────────────────────────────────────────────
 # ───── Notion schema helpers ─────
-from functools import lru_cache
 from difflib import SequenceMatcher
 
 FAQ_TITLE_PROP    = os.getenv("FAQ_TITLE_PROP", "Question")
@@ -579,9 +683,6 @@ def _notion_headers():
         "Notion-Version": "2022-06-28",
         "Content-Type": "application/json",
     }
-
-from functools import lru_cache
-from difflib import SequenceMatcher
 
 @lru_cache(maxsize=64)
 def _notion_props(db_id: str) -> dict:
@@ -666,19 +767,13 @@ def search_notion_faq(keyword):
     for db_id in map(str.strip, database_ids):
         if not db_id:
             continue
-        text_props = _notion_text_props(db_id)[:6]  # 과대 payload 방지
+        text_props = _notion_text_props(db_id)[:6]
         if not text_props:
             print(f"⚠️ Notion: text propsなし ({db_id})")
             continue
 
-        # 서버측 OR 필터: 모든 텍스트 속성(title, rich_text)에 대해 contains OR
-        or_filters = []
-        for t in terms[:8]:
-            for p in text_props:
-                or_filters.append({"property": p, "rich_text" if p != _get_title.__name__ else "title": {"contains": t}})
-
-        # title도 Notionでは rich_textで検索できるため一律 rich_text に統一
-        props_meta = _notion_props(db_id)  # 既存キャッシュ関数
+        # ← ここから: or_filters は一度だけ構築
+        props_meta = _notion_props(db_id)
         or_filters = []
         for t in terms[:8]:
             for p in text_props:
@@ -686,37 +781,33 @@ def search_notion_faq(keyword):
                 or_filters.append({"property": p, cond: {"contains": t}})
 
         payload = {"filter": {"or": or_filters}} if or_filters else {}
-        slog("notion.query",
-            db_id=db_id,
-            props="|".join(text_props),
-            terms="|".join(terms),
-            filters=len(or_filters))
+        slog("notion.query", db_id=db_id, props="|".join(text_props), terms="|".join(terms), filters=len(or_filters))
 
-        r = http_post(f"https://api.notion.com/v1/databases/{db_id}/query",
-                    headers=headers, json=payload)
+        r = http_post(f"https://api.notion.com/v1/databases/{db_id}/query", headers=headers, json=payload)
         print(f"[NOTION] status={r.status_code} bytes={len(r.text)}")
+
         if r.status_code == 200:
-            hits = len((r.json() or {}).get("results") or [])
-            print(f"[NOTION] hits={hits}")
+            data = r.json() or {}
+            results = data.get("results") or []
+            print(f"[NOTION] hits={len(results)}")
+            # ← ここがバグ修正の本体: 取得結果を収集
+            all_results.extend(results)
         else:
             print(f"[NOTION] error-body={r.text[:200]}")
 
     if not all_results:
         return "🙅 関連するFAQが見つかりませんでした。"
 
-    # 재랭킹: 정확 매치 가중치 + 퍼지 점수
+    # 以降は既存の再ランキング処理そのまま
     q_text = _normalize_query(keyword)
     def _score(props):
         txt = _notion_collect_text(props)
         exact = sum(1 for t in terms if t in txt) * 3
-        fuzzy = int(100 * SequenceMatcher(None, q_text, txt[:2000]).ratio()) // 10  # 0..10
+        fuzzy = int(100 * SequenceMatcher(None, q_text, txt[:2000]).ratio()) // 10
         return exact + fuzzy
 
-    ranked = sorted(
-        ((_score(r.get("properties", {}) or {}), r) for r in all_results),
-        key=lambda x: x[0],
-        reverse=True
-    )
+    ranked = sorted(((_score(r.get("properties", {}) or {}), r) for r in all_results),
+                    key=lambda x: x[0], reverse=True)
     top = [r for s, r in ranked if s > 0][:5]
     if not top:
         return "🙅 入力内容と類似するFAQが見つかりませんでした。"
@@ -735,17 +826,12 @@ def search_notion_faq(keyword):
 # ───── Zendesk search helpers (keywords + sentence, fallback, rerank) ─────
 _ZDK_PUNCT = r"[、。；;：:（）()【】\[\]「」『』]+"
 def _normalize_query_for_zendesk(q: str) -> str:
-    q = (q or "").strip()
+    q = unicodedata.normalize("NFKC", (q or "").strip())
     q = re.sub(_ZDK_PUNCT, " ", q)
     q = re.sub(r"\s+", " ", q)
     return q
 
 _MIXED_WORD_RE = re.compile(r"[A-Za-z0-9._-]*[\u3040-\u30FF]+[A-Za-z0-9._-]*")
-
-def _to_fullwidth_ascii(s: str) -> str:
-    return "".join(chr(ord(c)+0xFEE0) if "!" <= c <= "~" else c for c in s)
-def _to_halfwidth_ascii(s: str) -> str:
-    return "".join(chr(ord(c)-0xFEE0) if "！" <= c <= "～" else c for c in s)
 
 def _expand_mixed_variants(term: str):
     res = {term}
@@ -814,9 +900,9 @@ def _zendesk_search_all(url, auth, query, max_pages=3):
     base_params = {"query": query, "per_page": 100, "sort_by": "updated_at", "sort_order": "desc"}
     while query and page < max_pages:
         if page_url:
-            res = requests.get(page_url, auth=auth, timeout=20)                     # ← 직접 호출
+            res = http_get(page_url, auth=auth, timeout=20)
         else:
-            res = requests.get(url, auth=auth, params=base_params, timeout=20)      # ← 직접 호출
+            res = http_get(url, auth=auth, params=base_params, timeout=20)
         if res.status_code != 200:
             slog("zendesk.http_error", code=res.status_code, body=res.text[:300]); break
         payload = res.json() or {}
@@ -952,7 +1038,7 @@ def _zendesk_boot_healthcheck():
         raise RuntimeError(f"ENV missing for Zendesk: sub={sub!r}, email={email!r}, token={'set' if bool(token) else 'empty'}")
 
     url = f"https://{sub}.zendesk.com/api/v2/users/me.json"
-    r = requests.get(url, auth=(f"{email}/token", token), timeout=15)
+    r = http_get(url, auth=(f"{email}/token", token), timeout=15)
     role = ((r.json().get("user") or {}).get("role")) if r.headers.get("content-type","").startswith("application/json") else None
     slog("zendesk.boot", status=r.status_code, role=role, sub=sub, email=email)
 
@@ -1070,7 +1156,7 @@ def handle_feedback_no(ack, body, say, client):
 def correct_typo_with_gpt(input_text: str) -> str:
     try:
         r = OAI.chat.completions.create(
-            model="gpt-5",
+            model="gpt-4o",
             messages=[
                 {"role": "system", "content":
                  "あなたは日本語のスペルチェッカーです。\n"
@@ -1089,7 +1175,7 @@ def correct_typo_with_gpt(input_text: str) -> str:
 def extract_keywords_ai(q: str) -> str:
     try:
         r = OAI.chat.completions.create(
-            model="gpt-5",
+            model="gpt-4o",
             messages=[
                 {"role":"system","content":
                  "与えられた文から検索用のキーワードを3〜8個抽出して、日本語/英語のままカンマ区切りで返す。説明不要。"},
@@ -1218,7 +1304,7 @@ import os
 import openai
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL_SUMMARY = os.getenv("OPENAI_MODEL_SUMMARY", "gpt-5")
+OPENAI_MODEL_SUMMARY = os.getenv("OPENAI_MODEL_SUMMARY", "gpt-4o")
 
 def summarize_search_outputs_ja(query: str, notion: Any, zendesk: Any, slack: Any, gmail: Any, max_tokens: int = 300) -> str:
     """検索結果を日本語で5行以内の箇条書きに要約"""
