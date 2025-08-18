@@ -1214,6 +1214,9 @@ def _to_text(name: str, val: Any, limit_items: int = 10, limit_chars: int = 2000
 # ─────────────────────────────────────────────────────────────
 # 要約呼び出し
 # ─────────────────────────────────────────────────────────────
+import os
+import openai
+OPENAI_MODEL_SUMMARY = os.getenv("OPENAI_MODEL_SUMMARY", "gpt-5")
 
 def summarize_search_outputs_ja(query: str, notion: Any, zendesk: Any, slack: Any, gmail: Any, max_tokens: int = 300) -> str:
     """検索結果を日本語で5行以内の箇条書きに要約"""
