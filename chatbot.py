@@ -1711,7 +1711,7 @@ def start_auto_gmail_checker():
                 except Exception as e:
                     print(f"[❌ 自動チェック失敗] {acct.get('email','(unknown)')}: {e}")
 
-            time.sleep(600)  # 10분
+            time.sleep(1800)  # 30분
     # 必要に応じて自動チェックを有効化
     threading.Thread(target=loop, daemon=True).start()
 
