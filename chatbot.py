@@ -166,6 +166,33 @@ def _split_terms(text: str):
             out.append(t)
     return out
 
+# 약어 사전은 환경변수 JSON로도 받게(운영 중 갱신용)
+_ABBR_MAP = json.loads(os.getenv("ABBR_SYNONYMS_JSON","{}") or "{}")
+# 예: {"webul": ["web unsafe list"]}
+
+_CAMEL_SPLIT = re.compile(r"(?<!^)(?=[A-Z])")
+
+def expand_query_variants(q: str) -> list[str]:
+    qn = _normalize_query(q)
+    out = {qn}
+    # 공백제거/전각 기존 변형
+    out.add(qn.replace(" ", ""))
+
+    # 단어별 CamelCase 분해 & 결합
+    for tok in _TOKEN_RE.findall(qn):
+        # 약어 사전 확장
+        for exp in _ABBR_MAP.get(tok.lower(), []):
+            out.add(exp)
+            out.add(exp.replace(" ", ""))  # 붙여쓴 변형
+        # CamelCase → 단어열
+        if tok and tok[0].isupper() and any(c.isupper() for c in tok[1:]):
+            parts = _CAMEL_SPLIT.split(tok)  # WebUL → ["Web","U","L"] / WebUnsafeList → ["Web","Unsafe","List"]
+            if len(parts) >= 2:
+                phrase = " ".join(parts)
+                out.add(phrase)                 # "Web Unsafe List"
+                out.add(phrase.replace(" ","")) # "WebUnsafeList"
+    return [v for v in out if v]
+
 def safe_post_to_slack(client: WebClient, **kwargs):
     for i in range(5):
         try:
@@ -274,13 +301,16 @@ def unified_score(query: str, text: str, title: str | None = None,
     if ta:
         bm25 += 0.5 * _bm25_score(q_terms, ta, idf, avgdl)
 
-    # 문구 일치 보너스(공백/전각 변형 포함)
+    # 문구 일치 보너스(공백/전각 + 공백무시)
     phrase_bonus = 0.0
-    for ph in q["phrases"]:
-        if ph and ph in da["text"]:
-            phrase_bonus += 2.0
-        if ta and ph and ph in ta["text"]:
-            phrase_bonus += 2.0
+    da_nos = da["text"].replace(" ", "")
+    ta_nos = (ta["text"].replace(" ", "") if ta else "")
+    for ph in q["phrases"] + expand_query_variants(q["qnorm"]):
+        if ph:
+            if ph in da["text"] or ph.replace(" ","") in da_nos:
+                phrase_bonus += 2.0
+            if ta and (ph in ta["text"] or ph.replace(" ","") in ta_nos):
+                phrase_bonus += 2.0
 
     # 근접 보너스
     prox = _proximity_bonus(qa["tokens"], da["tokens"])
@@ -908,6 +938,12 @@ def extract_keywords_jp(text):
 
 def search_notion_faq(keyword, top_k=3):
     terms = _split_terms(keyword)
+    variants = expand_query_variants(keyword)
+    # 긴 문구는 contains 대상으로만 사용
+    for ph in [v for v in variants if " " in v or v.isalpha()]:
+        for p in text_props:
+            cond = "title" if (props_meta.get(p, {}).get("type") == "title") else "rich_text"
+            or_filters.append({"property": p, cond: {"contains": ph}})
     database_ids = os.getenv("FAQ_DATABASE_ID", "").split(",")
     headers = _notion_headers()
     all_results = []
@@ -1010,6 +1046,16 @@ def _zendesk_terms(keyword: str):
 # 全角/半角・大文字小文字・ワイルドカードを含めて検索語を拡張
 # Zendesk: 문구 우선 + 기존 와일드카드 폴백
 def _zendesk_queries(keyword: str):
+    variants = expand_query_variants(keyword)
+    sentences = [ _normalize_query_for_zendesk(v) for v in variants ]
+    # 1) 문구 정확
+    for s in sentences:
+        if s:
+            qs.append(f'type:ticket (subject:"{s}" OR description:"{s}")')
+    # 2) 붙여쓴 변형에 대한 와일드카드 완화
+    for s in sentences:
+        if s and " " not in s and len(s) >= 5:
+            qs.append("type:ticket (" + " OR ".join([f"subject:{s}*", f"description:{s}*"]) + ")")
     sent   = _normalize_query_for_zendesk(keyword)
     terms  = [t for t in _zendesk_terms(keyword) if t.strip()]
     if not terms and not sent:
@@ -1521,7 +1567,7 @@ def summarize_search_outputs_ja(query: str, notion: Any, zendesk: Any, slack: An
         "2. Zendesk：「…」\n"
         "3. Slack・Gmail：「…」\n\n"
         "【制約】\n"
-        "- 各文50字以内。装飾禁止。N=0のときのみ『該当なし』と書く。\n\n"
+        "- 各文100字以内。装飾禁止。N=0のときのみ『該当なし』と書く。\n\n"
         f"[Notion]\n{_to_text('Notion', notion)}\n\n"
         f"[Zendesk]\n{_to_text('Zendesk', zendesk)}\n\n"
         f"[Slack]\n{_to_text('Slack', slack)}\n\n"
@@ -1555,7 +1601,7 @@ def generate_answer_ja(query: str, notion: Any, zendesk: Any, slack: Any, gmail:
     system = (
         "あなたは厳密な社内アシスタントです。以下の【検索結果】に含まれる事実のみに基づき、"
         "ユーザーの質問に日本語で簡潔に回答してください。推測や外部知識の持ち込みは禁止。"
-        "根拠が不足なら不足と明記し、必要な追加情報を1行で提案。最大500字、明瞭・具体的に。"
+        "根拠が不足なら不足と明記し、必要な追加情報を1行で提案。最大300字、明瞭・具体的に。"
     )
     user = (
         f"【ユーザー質問】\n{query}\n\n"
