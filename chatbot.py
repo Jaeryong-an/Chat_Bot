@@ -1216,9 +1216,13 @@ def search_zendesk_ticket_blocks(keyword, top_k=3):
         blocks.append({"type":"divider"})
     return blocks
 
-def _zendesk_blocks_to_lines(blocks: list, limit: int = 5):
+def _zendesk_blocks_to_lines(blocks, limit: int = 5):
+    if not isinstance(blocks, list):
+        return []
     rows = []
     for b in blocks:
+        if not isinstance(b, dict):
+            continue
         if b.get("type") != "section":
             continue
         t = ((b.get("text") or {}).get("text") or "")
@@ -1234,13 +1238,14 @@ def _zendesk_lines_to_text(rows):
     return "\n".join(f"#{r['id']} {r['subject']} [status:{r['status']}] <{r['url']}>" for r in rows) \
            or "🙅 チケットが見つかりませんでした。"
 
-def _zendesk_blocks_to_text(blocks: list, limit: int = 5) -> str:
+def _zendesk_blocks_to_text(blocks, limit: int = 5) -> str:
+    if not isinstance(blocks, list):
+        return "🙅 チケットが見つかりませんでした。"
     lines = []
     for b in blocks:
-        if b.get("type") != "section":
+        if not isinstance(b, dict) or b.get("type") != "section":
             continue
         t = ((b.get("text") or {}).get("text") or "")
-        # "*<...|#123 - 件名>*\nステータス: `open`" から抽出
         m = re.search(r"\|\#(\d+)\s-\s(.+?)\>\*\nステータス:\s`([^`]+)`", t)
         if m:
             tid, subj, status = m.groups()
@@ -1640,9 +1645,12 @@ def handle_mention_events(body, say):
             "slack": ex.submit(search_slack_channels, corrected_query),
             "gmail": ex.submit(_search_gmail_first_account, corrected_query),
         }
-        faq_result   = _await("faq",   futs["faq"],   15)
-        _z_blocks    = _await("zblk",  futs["zblk"],  15) or []
-        _z_rows      = _zendesk_blocks_to_lines(_z_blocks, limit=3)
+        faq_result = _await("faq", futs["faq"], 15)
+        _z_blocks  = _await("zblk", futs["zblk"], 15)
+        # ✅ 문자열/에러/None 방어
+        if _nohit_or_err(_z_blocks) or not isinstance(_z_blocks, list):
+            _z_blocks = []
+        _z_rows   = _zendesk_blocks_to_lines(_z_blocks, limit=3)
         zendesk_result_text = _zendesk_lines_to_text(_z_rows)
         slack_result = _await("slack", futs["slack"], SLACK_TIMEOUT)
         gmail_result = _await("gmail", futs["gmail"], 15)
@@ -1661,8 +1669,11 @@ def handle_mention_events(body, say):
                     "gmail": ex.submit(_search_gmail_first_account, kw2),
                 }
                 faq_result   = _await("faq",   futs2["faq"],   15)
-                _z_blocks    = _await("zblk",  futs2["zblk"],  15) or []
-                _z_rows      = _zendesk_blocks_to_lines(_z_blocks, limit=3)
+                _z_blocks = _await("zblk", futs2["zblk"], 15)
+                if _nohit_or_err(_z_blocks) or not isinstance(_z_blocks, list):
+                    _z_blocks = []
+                _z_rows = _zendesk_blocks_to_lines(_z_blocks, limit=3)
+                zendesk_result_text = _zendesk_lines_to_text(_z_rows)
                 zendesk_result_text = _zendesk_lines_to_text(_z_rows)
                 slack_result = _await("slack", futs2["slack"], SLACK_TIMEOUT)
                 gmail_result = _await("gmail", futs2["gmail"], 15)
