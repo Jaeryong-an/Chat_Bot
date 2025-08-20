@@ -1282,7 +1282,7 @@ def send_faq_with_feedback(say, title, answer, faq_id, corrected_query=None, use
     block_text = safe_block_text(
         f"<@{user}> さんへの回答\n"
         f"📌 *{title}*\n"
-        f"📝 {answer}"
+        f"💡 {answer}"
     )
     blocks = [
         {"type": "section","text": {"type": "mrkdwn","text": block_text}},
@@ -1650,7 +1650,7 @@ def handle_mention_events(body, say):
         corrected_query, notion_for_llm, z_for_llm, slack_for_llm, gmail_for_llm
     )
 
-    summary_bold = "*⭐️要約⭐️：*\n" + "\n".join(
+    summary_bold = "*該当内容：*\n" + "\n".join(
         f"*{line}*" if line.strip() else "" for line in summary_ja.splitlines()
     )
 
